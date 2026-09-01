@@ -1,0 +1,4 @@
+# Give only the installing desktop user read access to the built-in Apple
+# keyboard. The identically named trackpad is excluded because it has absolute
+# axes, while the keyboard reports an absolute-axis capability value of zero.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Apple Inc. Apple Internal Keyboard / Trackpad", ATTRS{id/vendor}=="05ac", ATTRS{capabilities/abs}=="0", RUN+="@SETFACL@ -m u:@USER@:r /dev/input/%k"
