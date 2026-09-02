@@ -3,8 +3,15 @@
 set -Eeuo pipefail
 
 TIMEOUT_SECONDS="${TRACKPAD_GUARD_TIMEOUT:-1.0}"
-APPLE_VENDOR="${TRACKPAD_GUARD_VENDOR:-05ac}"
-APPLE_DEVICE_NAME="${TRACKPAD_GUARD_KEYBOARD_NAME:-Apple Inc. Apple Internal Keyboard / Trackpad}"
+
+# Match constants for the keyd virtual keyboard (this machine's only
+# observable keyboard node behind the kmonad→keyd grab chain; see README).
+# Edit all four together with install.sh, uninstall.sh and rules/*.rules.in
+# if the remap stack changes — `make check` enforces they stay in sync.
+KEYBOARD_NAME="keyd virtual keyboard"
+KEYBOARD_VENDOR="0fac"
+KEYBOARD_PRODUCT="0ade"
+KEYBOARD_BUSTYPE="0003"
 
 keyboard_event=""
 trackpad_disabled=false
@@ -18,6 +25,23 @@ log() {
 
 if [[ ! "$TIMEOUT_SECONDS" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || [[ "$TIMEOUT_SECONDS" =~ ^0*([.]0*)?$ ]]; then
   log "TRACKPAD_GUARD_TIMEOUT must be a positive number"
+  exit 1
+fi
+
+# Fail fast on malformed match constants. The same values end up verbatim in
+# the udev rule installed by install.sh, where *, ? and [...] act as match
+# globs (a wildcard would turn the exact-match ACL into a pattern) and quotes
+# or control characters would corrupt the rule syntax parsed by root-udevd;
+# |, & and \ would additionally break the sed rendering of the rule template.
+for hex_value in "$KEYBOARD_VENDOR" "$KEYBOARD_PRODUCT" "$KEYBOARD_BUSTYPE"; do
+  if [[ ! "${hex_value,,}" =~ ^[0-9a-f]{4}$ ]]; then
+    log "keyboard match IDs must be 4 hex digits, got: $hex_value"
+    exit 1
+  fi
+done
+forbidden_name_chars='[][:cntrl:]"\\|&*?[]'
+if [[ -z "$KEYBOARD_NAME" || "$KEYBOARD_NAME" =~ $forbidden_name_chars ]]; then
+  log "keyboard match name is empty or contains forbidden characters"
   exit 1
 fi
 
@@ -36,21 +60,29 @@ fi
 printf '%s\n' "$$" > "$pid_file"
 
 discover_keyboard() {
-  local event_path input_path name vendor abs_caps
+  local event_path input_path name vendor product bustype
 
   keyboard_event=""
   for event_path in /sys/class/input/event*; do
     [[ -e "$event_path" ]] || continue
     input_path="$(readlink -f "$event_path/device")"
-    [[ -r "$input_path/name" && -r "$input_path/id/vendor" && -r "$input_path/capabilities/abs" ]] || continue
+    # The event source IS keyd's uinput node, so it must live under
+    # /sys/devices/virtual; a physical device spoofing these IDs is rejected.
+    case "$input_path" in
+      /sys/devices/virtual/*) ;;
+      *) continue ;;
+    esac
+    [[ -r "$input_path/name" && -r "$input_path/id/vendor" && -r "$input_path/id/product" && -r "$input_path/id/bustype" ]] || continue
 
     name="$(<"$input_path/name")"
     vendor="$(<"$input_path/id/vendor")"
-    abs_caps="$(<"$input_path/capabilities/abs")"
+    product="$(<"$input_path/id/product")"
+    bustype="$(<"$input_path/id/bustype")"
 
-    if [[ "$name" == "$APPLE_DEVICE_NAME" &&
-          "${vendor,,}" == "${APPLE_VENDOR,,}" &&
-          "$abs_caps" == "0" ]]; then
+    if [[ "$name" == "$KEYBOARD_NAME" &&
+          "${vendor,,}" == "${KEYBOARD_VENDOR,,}" &&
+          "${product,,}" == "${KEYBOARD_PRODUCT,,}" &&
+          "${bustype,,}" == "${KEYBOARD_BUSTYPE,,}" ]]; then
       keyboard_event="/dev/input/${event_path##*/}"
       break
     fi
@@ -73,6 +105,11 @@ set_trackpad_enabled() {
   hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = $enabled })" >/dev/null
 }
 
+# Defensive re-enable: a previous instance killed with SIGKILL may have left
+# the trackpad disabled, so every start (including systemd restarts) first
+# recovers a known enabled state.
+set_trackpad_enabled true 2>/dev/null || true
+
 cleanup() {
   trap - EXIT INT TERM HUP
   set_trackpad_enabled true 2>/dev/null || true
@@ -80,6 +117,11 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM HUP
+
+# keyd is a hard dependency: without its virtual keyboard there is no
+# observable keyboard node. The 30x1s discovery loop below tolerates keyd
+# starts/restarts, so here we only warn.
+command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet keyd && log "warning: keyd.service is not active; its virtual keyboard may not exist yet"
 
 for _ in {1..30}; do
   if discover_keyboard; then
@@ -89,12 +131,12 @@ for _ in {1..30}; do
 done
 
 if [[ ! -c "$keyboard_event" || ! -r "$keyboard_event" ]]; then
-  log "could not open the built-in Apple keyboard event device"
-  log "run ./install.sh again and inspect the troubleshooting section in README.md"
+  log "could not open the keyd virtual keyboard event device"
+  log "is keyd.service active? See the keyd/kmonad section in README.md"
   exit 1
 fi
 
-log "monitoring ${keyboard_event}; trackpad timeout is ${TIMEOUT_SECONDS}s"
+log "monitoring ${keyboard_event} (${KEYBOARD_NAME}); controlling ${trackpad_name}; trackpad timeout is ${TIMEOUT_SECONDS}s"
 
 declare -A held_modifiers=()
 
