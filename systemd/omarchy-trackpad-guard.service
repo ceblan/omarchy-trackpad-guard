@@ -1,0 +1,13 @@
+[Unit]
+Description=Omarchy Trackpad Guard (disable the touchpad while typing)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-trackpad-guard
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
