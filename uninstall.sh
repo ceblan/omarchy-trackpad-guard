@@ -4,28 +4,98 @@ set -Eeuo pipefail
 
 TARGET_BIN="$HOME/.local/bin/omarchy-trackpad-guard"
 AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
-RULE_PATH="/etc/udev/rules.d/99-apple-internal-keyboard-trackpad-guard.rules"
+RULE_PATH="/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
+UNIT_PATH="$HOME/.config/systemd/user/omarchy-trackpad-guard.service"
 MARKER_START="-- omarchy-trackpad-guard:start"
 MARKER_END="-- omarchy-trackpad-guard:end"
 CURRENT_USER="$(id -un)"
+
+# Match constants for the keyd virtual keyboard. Keep in sync with
+# bin/omarchy-trackpad-guard, install.sh and rules/*.rules.in —
+# `make check` enforces they stay identical.
+KEYBOARD_NAME="keyd virtual keyboard"
+KEYBOARD_VENDOR="0fac"
+KEYBOARD_PRODUCT="0ade"
+KEYBOARD_BUSTYPE="0003"
 
 if (( EUID == 0 )); then
   printf 'uninstall: run this as your normal desktop user, not as root\n' >&2
   exit 1
 fi
 
+# Stop the systemd unit first: its shutdown runs the guard's cleanup, which
+# re-enables the trackpad.
+systemctl --user disable --now omarchy-trackpad-guard.service 2>/dev/null || true
+
+# Fallback for pre-systemd or manually launched instances still holding the
+# flock. Only kills when the pidfile exists, the PID is numeric and
+# /proc/<pid>/cmdline contains exactly $TARGET_BIN.
+# Escalation is required: bash resumes the guard's blocking read after the
+# first SIGTERM trap (cleanup runs but the process survives), so TERM once
+# for a graceful cleanup and again once traps are cleared, with KILL as last
+# resort; the evtest coproc also inherits the flock fd, so its PID (a direct
+# child) must be terminated too or the lock outlives the guard.
 pid_file="${XDG_RUNTIME_DIR:-/tmp}/omarchy-trackpad-guard-${UID}.pid"
 if [[ -r "$pid_file" ]]; then
   guard_pid="$(<"$pid_file")"
   if [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$guard_pid/cmdline" ]] && tr '\0' '\n' < "/proc/$guard_pid/cmdline" | grep -Fxq "$TARGET_BIN"; then
+    child_pids="$(pgrep -P "$guard_pid" 2>/dev/null || true)"
     kill "$guard_pid" 2>/dev/null || true
     for _ in {1..20}; do
       kill -0 "$guard_pid" 2>/dev/null || break
       sleep 0.1
     done
+    if kill -0 "$guard_pid" 2>/dev/null; then
+      kill "$guard_pid" 2>/dev/null || true
+      for _ in {1..20}; do
+        kill -0 "$guard_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+    if kill -0 "$guard_pid" 2>/dev/null; then
+      kill -KILL "$guard_pid" 2>/dev/null || true
+    fi
+    for child_pid in $child_pids; do
+      kill "$child_pid" 2>/dev/null || true
+    done
+    for child_pid in $child_pids; do
+      for _ in {1..10}; do
+        kill -0 "$child_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    done
+    for child_pid in $child_pids; do
+      if kill -0 "$child_pid" 2>/dev/null; then
+        kill -KILL "$child_pid" 2>/dev/null || true
+        for _ in {1..10}; do
+          kill -0 "$child_pid" 2>/dev/null || break
+          sleep 0.1
+        done
+      fi
+    done
   fi
 fi
 
+# The lock should be free after the stop, with or without a pidfile: the
+# evtest coproc inherits the flock fd and can outlive both the guard and its
+# pidfile. Only warn here — nothing further depends on the lock.
+lock_file="${XDG_RUNTIME_DIR:-/tmp}/omarchy-trackpad-guard-${UID}.lock"
+if [[ -e "$lock_file" ]]; then
+  for _ in {1..30}; do
+    flock -n "$lock_file" -c true 2>/dev/null && break
+    sleep 0.1
+  done
+  if ! flock -n "$lock_file" -c true 2>/dev/null; then
+    printf 'uninstall: warning: a previous guard instance still holds %s; find the holder with '\''fuser %s'\''\n' "$lock_file" "$lock_file" >&2
+  fi
+fi
+
+# Stop sequence complete; now remove the unit files.
+rm -f -- "$UNIT_PATH"
+systemctl --user daemon-reload 2>/dev/null || true
+
+# Defensive: strip any leftover marked autostart block from the Apple-era
+# version (a no-op on clean machines).
 if [[ -f "$AUTOSTART_FILE" ]]; then
   temp_autostart="$(mktemp)"
   trap 'rm -f -- "$temp_autostart"' EXIT
@@ -42,11 +112,25 @@ fi
 for event_path in /sys/class/input/event*; do
   [[ -e "$event_path" ]] || continue
   input_path="$(readlink -f "$event_path/device")"
-  [[ -r "$input_path/name" && -r "$input_path/id/vendor" && -r "$input_path/capabilities/abs" ]] || continue
-  if [[ "$(<"$input_path/name")" == "Apple Inc. Apple Internal Keyboard / Trackpad" &&
-        "$(<"$input_path/id/vendor")" == "05ac" &&
-        "$(<"$input_path/capabilities/abs")" == "0" ]]; then
-    sudo setfacl -x "u:$CURRENT_USER" "/dev/input/${event_path##*/}" 2>/dev/null || true
+  # Only the keyd uinput node can hold our ACL; it lives under
+  # /sys/devices/virtual.
+  case "$input_path" in
+    /sys/devices/virtual/*) ;;
+    *) continue ;;
+  esac
+  [[ -r "$input_path/name" && -r "$input_path/id/vendor" && -r "$input_path/id/product" && -r "$input_path/id/bustype" ]] || continue
+  if [[ "$(<"$input_path/name")" == "$KEYBOARD_NAME" &&
+        "$(<"$input_path/id/vendor")" == "${KEYBOARD_VENDOR,,}" &&
+        "$(<"$input_path/id/product")" == "${KEYBOARD_PRODUCT,,}" &&
+        "$(<"$input_path/id/bustype")" == "${KEYBOARD_BUSTYPE,,}" ]]; then
+    keyboard_node="/dev/input/${event_path##*/}"
+    sudo setfacl -x "u:$CURRENT_USER" "$keyboard_node" 2>/dev/null || true
+    # setfacl -x leaves a residual mask entry behind; drop it only when no
+    # other named ACL entries remain on the node, so uninstall is traceless
+    # without clobbering ACLs owned by other software.
+    if ! getfacl "$keyboard_node" 2>/dev/null | grep -Eq '^(user|group):[^:]'; then
+      sudo setfacl -b "$keyboard_node" 2>/dev/null || true
+    fi
   fi
 done
 
@@ -62,5 +146,4 @@ if [[ -n "$trackpad_name" && "$trackpad_name" != *[[:cntrl:]]* ]]; then
   hyprctl eval "hl.device({ name = \"$quoted_name\", enabled = true })" >/dev/null 2>&1 || true
 fi
 
-hyprctl reload >/dev/null 2>&1 || true
-printf 'Omarchy Trackpad Guard was removed. The evtest and acl packages were left installed.\n'
+printf 'Omarchy Trackpad Guard was removed (systemd unit, udev rule, ACL and binary). The evtest and acl packages were left installed.\n'
