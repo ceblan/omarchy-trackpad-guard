@@ -2,7 +2,7 @@
 
 An Omarchy/Hyprland palm-rejection daemon for laptops whose keyboard is hidden behind a remap stack.
 
-While normal text keys are being pressed, the guard disables the trackpad. It re-enables the trackpad after one second of keyboard inactivity, so tap-to-click and physical clicking continue to work normally between typing bursts. Modifier shortcuts and navigation keys re-enable the trackpad immediately.
+While normal text keys are being pressed, the guard freezes the trackpad with an exclusive evdev grab. It releases the grab after one second of keyboard inactivity, so tap-to-click and physical clicking continue to work normally between typing bursts. Modifier shortcuts and navigation keys release the grab immediately.
 
 This build targets the **ASUS ROG Zephyrus G14 2024 (GA403)** running Omarchy with an active **kmonad → xremap** remap stack. It dynamically discovers the input event node and the Hyprland touchpad name, so it does not hard-code an event number, a username, or a device name.
 
@@ -21,7 +21,7 @@ flowchart LR
     E --> F["guard (ACL read-only)<br>+ libinput/Hyprland"]
 ```
 
-evdev is multi-reader: the guard watches the xremap node without interfering with Hyprland. The udev rule grants read access to that one node only. Unlike keyd's reserved `0fac:0ade` namespace, the `1234:9950` IDs are **not** an xremap constant — they are this machine's convention, set by `xremap.service` via `--vendor 0x1234 --product 0x9950 --output-device-name "xremap virtual keyboard"`. Port the flags, port the plugin.
+evdev is multi-reader: the guard watches the xremap node without interfering with Hyprland. The udev rule grants read access to that one keyboard node only (a second match in the same file covers the touchpad — see *How it works*). Unlike keyd's reserved `0fac:0ade` namespace, the `1234:9950` IDs are **not** an xremap constant — they are this machine's convention, set by `xremap.service` via `--vendor 0x1234 --product 0x9950 --output-device-name "xremap virtual keyboard"`. Port the flags, port the plugin.
 
 Verified on this stack (2026-09-03, captured from `event19`):
 
@@ -43,7 +43,7 @@ Do not run the installer with `sudo`. It asks for sudo only when installing the 
 
 1. Installs `evtest` and `acl` through `omarchy pkg add` if needed.
 2. Installs the guard at `~/.local/bin/omarchy-trackpad-guard`.
-3. Adds a device-specific udev rule granting read access to xremap's virtual keyboard (removing the legacy keyd-era rule if present), and verifies the ACL actually landed before continuing.
+3. Adds a device-specific udev rule granting read access to exactly two nodes — xremap's virtual keyboard (the guard's event source) and the touchpad (grabbed while typing) — removing legacy keyd-era/xremap-only rules if present, and verifies both ACLs actually landed before continuing.
 4. Installs and starts the **systemd user unit** `omarchy-trackpad-guard.service` (`Restart=on-failure`, tied to `graphical-session.target`).
 5. Deploys the bar widget to `~/.config/omarchy/plugins/ceblan.trackpad-guard` and enables it.
 
@@ -86,20 +86,22 @@ systemctl --user restart omarchy-trackpad-guard
 ./uninstall.sh
 ```
 
-This stops and disables the unit, removes the unit file and any timeout drop-in, removes the bar plugin, deletes the udev rule and the device ACL, removes the guard binary and runtime files, and re-enables the trackpad. It leaves `evtest` and `acl` installed because other software may use them. After removing the ACL it re-triggers udev on the node, so any coexisting rule that matches it (e.g. voxtype's ACL rule) immediately re-applies its own ACL — the node ends as it was before this plugin was installed.
+This stops and disables the unit, removes the unit file and any timeout drop-in, removes the bar plugin, deletes the udev rule and both device ACLs (keyboard and touchpad), removes the guard binary and runtime files, and re-enables the trackpad. It leaves `evtest` and `acl` installed because other software may use them. After removing the ACL it re-triggers udev on the keyboard node, so any coexisting rule that matches it (e.g. voxtype's ACL rule) immediately re-applies its own ACL — the node ends as it was before this plugin was installed.
 
 ## How it works
 
-Hyprland's built-in `disable_while_typing` may release the trackpad sooner than is comfortable between words. This guard reads key events from xremap's virtual keyboard and controls only the detected Hyprland touchpad (`omarchy-hw-touchpad` → `hl.device` runtime API).
+Hyprland's built-in `disable_while_typing` may release the trackpad sooner than is comfortable between words. This guard reads key events from xremap's virtual keyboard and, while text keys are being pressed, holds an **exclusive evdev grab** (`EVIOCGRAB`, via a coprocessed `evtest --grab`) on the touchpad node (`omarchy-hw-touchpad` → sysfs name → `/dev/input/eventNN`, re-resolved before every grab). While the grab is held, the kernel delivers touch events only to the guard's fd, so libinput/Hyprland see nothing and the pointer stays frozen. Releasing is just closing the fd.
 
-The trackpad is disabled only for ordinary text-key presses. It is restored:
+**Why a grab instead of `hl.device(enabled=…)`:** an earlier version of this plugin toggled the Hyprland device per typing burst. Each toggle re-initializes the I2C HID device; under real use this produced intermittent ghost contacts on the untouched touchpad and stuck touch state in Hyprland (every gesture needed one extra finger until `hyprctl reload`) — the "dead trackpad" incident of 2026-09-04. An fd-bound grab costs nothing to acquire or release, never re-initializes the device, and disappears automatically when the fd closes. A watchdog kills the grabber if the guard is `SIGKILL`-ed outside systemd, and systemd's default `KillMode=control-group` reaps it on unit stop/restart, so a dead guard can never leave the touchpad frozen.
+
+The trackpad is grabbed only for ordinary text-key presses. The grab is released:
 
 - after the configured idle timeout;
 - immediately for modifier keys and navigation keys (including remaps that emit navigation keys, e.g. `Ctrl+a` → Home);
-- whenever the guard exits, including `SIGINT`, `SIGTERM`, logout, or a keyboard event-stream failure; and
-- defensively at every start, so a `SIGKILL`-ed previous instance can never leave the trackpad dead.
+- whenever the guard exits, including `SIGINT`, `SIGTERM`, logout, or a keyboard event-stream failure (fd close releases the grab); and
+- a one-shot `hl.device(enabled=true)` runs at every start and exit, purely to recover from state left by pre-grab versions — never per keystroke.
 
-Every toggle is logged to the journal (`journalctl --user -u omarchy-trackpad-guard`).
+Every grab/release is logged to the journal (`journalctl --user -u omarchy-trackpad-guard`).
 
 **Native `disable_while_typing`:** the guard supersedes it (configurable timeout plus modifier/navigation exceptions), so turning it off in `~/.config/hypr/input.lua` loses nothing. It is also a reasonable *diagnostic* step if the cursor ever seems stuck with this stack: one unproven hypothesis is that libinput's DWT can remain in the "typing" state while a modifier is held virtually by a kmonad/xremap layer. This has **not** been confirmed with an isolation test; treat disabling DWT as an experiment, not a proven fix.
 
@@ -107,13 +109,13 @@ The implementation was informed by the approach discussed in [omacom/omarchy dis
 
 ## Security note
 
-Linux normally restricts raw keyboard input. The installer adds an ACL that lets the installing desktop user read only xremap's virtual keyboard node — nothing physical, nothing else. The udev match is exact (`name` + `id/vendor` + `id/product` + `id/bustype`) with no wildcards, and the guard additionally requires the node to live under `/sys/devices/virtual/`. `make check` enforces that the match constants stay identical across the guard, the installer, the uninstaller and the udev rule template.
+Linux normally restricts raw keyboard input. The installer adds ACLs that let the installing desktop user read exactly two nodes: xremap's virtual keyboard (the event source) and the touchpad (the grab target) — nothing physical beyond the touchpad, nothing else. Each udev match is exact (keyboard: `name` + `id/vendor` + `id/product` + `id/bustype`; touchpad: `ATTRS{name}` + `ID_INPUT_TOUCHPAD`) with no wildcards, the guard additionally requires the keyboard node to live under `/sys/devices/virtual/`, and the touchpad rule disambiguates the twin "Mouse" interface of the same I2C HID device. `make check` enforces that the keyboard match constants stay identical across the guard, the installer, the uninstaller and the udev rule template.
 
 The match IDs are a local convention of this machine's `xremap.service` (its `--vendor`/`--product` flags), not a reserved xremap namespace — the exact match still pins the ACL to one synthetic node, and the `/sys/devices/virtual` requirement rejects any physical device spoofing the same IDs.
 
 Another udev rule may legitimately match the same node (on this machine, voxtype's push-to-talk ACL rule does, granting the same user the same read bit). The two rules coexist harmlessly: udev runs both, the ACL is idempotent, and the uninstaller re-triggers udev after removing its own rule so the surviving rule restores its ACL at once.
 
-Any process already running as that user can therefore read raw events from this keyboard. That is the unavoidable tradeoff for implementing this workaround in user space. The rule does not make the device world-readable and does not run the guard as root. `sudo` is used only interactively during install/uninstall; sudoers is never touched.
+Any process already running as that user can therefore read raw events from this keyboard (and the touchpad). That is the unavoidable tradeoff for implementing this workaround in user space. The rule does not make the devices world-readable and does not run the guard as root. `sudo` is used only interactively during install/uninstall; sudoers is never touched.
 
 ## Troubleshooting
 
@@ -124,11 +126,11 @@ systemctl --user status omarchy-trackpad-guard
 journalctl --user -u omarchy-trackpad-guard -f
 ```
 
-Check the ACL and confirm exactly one node has one:
+Check the ACLs and confirm the expected nodes have one (the keyboard node — event19 today — plus the touchpad; note voxtype's coexisting rule also grants one on the keyboard node):
 
 ```bash
 getfacl /dev/input/event19            # adapt to the current xremap node
-getfacl -ps /dev/input/event* | grep '^# file'
+getfacl -ps /dev/input/event* | grep -B9 '^user:.*:r--' | grep '^# file'
 ```
 
 To find the current xremap node:
@@ -142,7 +144,14 @@ done
 
 Prove the guard (not Hyprland's native `disable_while_typing`) is what freezes your trackpad: set `TRACKPAD_GUARD_TIMEOUT=3` via the panel slider or a drop-in, restart the unit, type, and measure — a ~3 s release is the guard; near-instant release is Hyprland.
 
-If the cursor seems lost: move the trackpad (Hyprland hides the cursor while typing; only pointer motion brings it back). Then check the journal — the guard logs every disable/enable. To isolate the guard completely during diagnosis:
+If the touchpad ever shows ghost contacts or gestures need an extra finger (the signature of the pre-grab toggle design; should be impossible now), recover with:
+
+```bash
+systemctl --user stop omarchy-trackpad-guard   # releases any grab and re-enables the device
+hyprctl reload                                 # re-initializes input devices, clearing stuck touch state
+```
+
+If the cursor seems lost: move the trackpad (Hyprland hides the cursor while typing; only pointer motion brings it back). Then check the journal — the guard logs every grab/release. To isolate the guard completely during diagnosis:
 
 ```bash
 systemctl --user stop omarchy-trackpad-guard   # its cleanup re-enables the trackpad
@@ -155,12 +164,14 @@ If the installer reports a held lock, find the holder and kill it:
 fuser "${XDG_RUNTIME_DIR:-/tmp}/omarchy-trackpad-guard-${UID}.lock"
 ```
 
+If the journal warns that the touchpad node is missing or unreadable, the grab is skipped and the pointer keeps working (fail safe) — check the touchpad ACL and re-run `./install.sh` to re-render the rule if the touchpad changed.
+
 If `xremap` (or `kmonad`) is stopped, the guard exits and the trackpad simply stays enabled — it fails safe. Start/enable `xremap.service` and the unit recovers on its own.
 
 ## Compatibility
 
 - ASUS ROG Zephyrus G14 2024 (GA403) with Omarchy, Hyprland (Lua config), and an active kmonad → xremap stack.
-- Any other machine with the same stack works if its `xremap.service` uses the same `--vendor 0x1234 --product 0x9950 --output-device-name "xremap virtual keyboard"` flags — the match IDs are xremap's flags, not the laptop's.
+- Other laptops work too: the touchpad ACL rule is rendered at install time from the detected touchpad's sysfs name, and the keyboard match is portable wherever `xremap.service` uses the same `--vendor 0x1234 --product 0x9950 --output-device-name "xremap virtual keyboard"` flags — the match IDs are xremap's flags, not the laptop's.
 - Bash 5, `evtest`, `acl`, `udev`, `systemd --user`, Omarchy hardware helpers and the Omarchy shell (for the bar widget).
 
 **xremap without kmonad** (xremap grabs the physical ITE keyboard directly): as long as the same `--vendor`/`--product`/`--output-device-name` flags are kept, nothing changes — the node still lives under `/sys/devices/virtual` and matches the same constants.
