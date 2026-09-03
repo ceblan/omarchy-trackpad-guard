@@ -5,8 +5,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_BIN="$HOME/.local/bin/omarchy-trackpad-guard"
 AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
-RULE_TEMPLATE="$SCRIPT_DIR/rules/99-xremap-virtual-keyboard-trackpad-guard.rules.in"
-RULE_PATH="/etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules"
+RULE_TEMPLATE="$SCRIPT_DIR/rules/99-trackpad-guard-acl.rules.in"
+RULE_PATH="/etc/udev/rules.d/99-trackpad-guard-acl.rules"
 MARKER_START="-- omarchy-trackpad-guard:start"
 MARKER_END="-- omarchy-trackpad-guard:end"
 CURRENT_USER="$(id -un)"
@@ -56,6 +56,33 @@ if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet xremap;
   printf 'install: warning: xremap.service is not active; the xremap virtual keyboard may not exist\n' >&2
 fi
 
+# Resolve the touchpad's sysfs input name for the second udev rule: the
+# guard holds an exclusive evdev grab on this node while typing, so the
+# ACL must land on exactly this interface. omarchy-hw-touchpad prints the
+# Hyprland name (the sysfs name lowercased, spaces as dashes); the rule
+# matches the raw sysfs name.
+touchpad_hypr_name="$(omarchy-hw-touchpad)" || die "could not identify the Hyprland touchpad"
+[[ -n "$touchpad_hypr_name" && "$touchpad_hypr_name" != *[[:cntrl:]]* ]] || die "unsafe Hyprland touchpad name: $touchpad_hypr_name"
+touchpad_sysfs_name=""
+touchpad_sysname=""
+for event_path in /sys/class/input/event*; do
+  [[ -e "$event_path" && -r "$event_path/device/name" ]] || continue
+  candidate="$(<"$event_path/device/name")"
+  normalized="${candidate,,}"
+  normalized="${normalized// /-}"
+  if [[ "$normalized" == "$touchpad_hypr_name" ]]; then
+    touchpad_sysfs_name="$candidate"
+    touchpad_sysname="${event_path##*/}"
+    break
+  fi
+done
+[[ -n "$touchpad_sysfs_name" ]] || die "could not map Hyprland touchpad '$touchpad_hypr_name' to a sysfs input node"
+# The name lands verbatim inside ATTRS{name}=="..."; reject characters that
+# udev would treat as match globs or that would corrupt the rule/sed syntax.
+if [[ "$touchpad_sysfs_name" =~ $forbidden_name_chars ]]; then
+  die "touchpad sysfs name contains forbidden characters: $touchpad_sysfs_name"
+fi
+
 if ! command -v evtest >/dev/null 2>&1; then
   printf 'Installing evtest through Omarchy...\n'
   omarchy pkg add evtest
@@ -78,18 +105,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sed -e "s|@SETFACL@|$SETFACL_PATH|g" -e "s|@USER@|$CURRENT_USER|g" "$RULE_TEMPLATE" > "$temp_rule"
+sed -e "s|@SETFACL@|$SETFACL_PATH|g" -e "s|@USER@|$CURRENT_USER|g" -e "s|@TOUCHPAD_NAME@|$touchpad_sysfs_name|g" "$RULE_TEMPLATE" > "$temp_rule"
 sudo install -Dm644 "$temp_rule" "$RULE_PATH"
 
-# Defensive migration from the keyd-era version: remove the legacy rule name
-# if a previous install left it behind (a no-op on clean machines). Leaving
-# it would keep an ACL on a node that no longer exists and duplicate matches
-# if the stack ever moved back.
-LEGACY_RULE_PATH="/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
-if [[ -f "$LEGACY_RULE_PATH" ]]; then
-  sudo rm -f -- "$LEGACY_RULE_PATH"
-  printf 'Removed legacy keyd-era udev rule: %s\n' "$LEGACY_RULE_PATH"
-fi
+# Defensive migration from previous versions: remove legacy rule names if a
+# previous install left them behind (no-ops on clean machines). The keyd-era
+# rule would keep an ACL on a node that no longer exists; the intermediate
+# xremap-only rule predates the touchpad ACL and is superseded by RULE_PATH.
+for legacy_rule in \
+  /etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules \
+  /etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules; do
+  if [[ -f "$legacy_rule" ]]; then
+    sudo rm -f -- "$legacy_rule"
+    printf 'Removed legacy udev rule: %s\n' "$legacy_rule"
+  fi
+done
 
 sudo udevadm control --reload-rules
 
@@ -122,6 +152,15 @@ sudo udevadm settle
 keyboard_node="/dev/input/$keyboard_sysname"
 if ! getfacl "$keyboard_node" 2>/dev/null | grep -Fxq "user:$CURRENT_USER:r--"; then
   die "udev rule did not grant read access on $keyboard_node; inspect $RULE_PATH"
+fi
+
+# Same trigger+verify for the touchpad rule: without this ACL the guard
+# cannot grab the node and every grab attempt would warn and skip.
+sudo udevadm trigger --action=change --subsystem-match=input --sysname-match="$touchpad_sysname"
+sudo udevadm settle
+touchpad_node="/dev/input/$touchpad_sysname"
+if ! getfacl "$touchpad_node" 2>/dev/null | grep -Fxq "user:$CURRENT_USER:r--"; then
+  die "udev rule did not grant read access on $touchpad_node; inspect $RULE_PATH"
 fi
 
 # Defensive migration from the Apple-era version: strip any leftover marked
@@ -229,5 +268,5 @@ printf '  Guard:  %s\n' "$TARGET_BIN"
 printf '  Rule:   %s\n' "$RULE_PATH"
 printf '  Unit:   %s\n' "$HOME/.config/systemd/user/omarchy-trackpad-guard.service"
 printf '  Panel:  %s (bar icon)\n' "$PLUGIN_DIR"
-printf 'The trackpad now stays disabled until typing has been idle for 1 second.\n'
+printf 'The trackpad is now grabbed (frozen) while you type and released after 1 second of idle.\n'
 printf 'Check it with: systemctl --user status omarchy-trackpad-guard\n'
