@@ -1,0 +1,14 @@
+# Give only the installing desktop user read access to the xremap virtual
+# keyboard. On this machine the physical keyboard (ITE 0b05:19b6) is
+# grabbed by kmonad, whose output is in turn grabbed by xremap, so xremap's
+# uinput node is the only userspace-observable keyboard. Unlike keyd's
+# reserved 0fac:0ade namespace, the 1234:9950 IDs are NOT an xremap
+# constant: they come from this machine's xremap.service flags
+# (--vendor 0x1234 --product 0x9950), so they are a local convention —
+# keep them in sync with that unit. The guard additionally requires the
+# node to live under /sys/devices/virtual. The abs==0 trick from the
+# Apple version is gone: keyboard and touchpad are distinct devices here.
+# Match values are compile-time constants validated by `make check`; udev
+# treats *, ? and [...] as match globs, so never introduce wildcards here
+# — the ACL must stay an exact match.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="xremap virtual keyboard", ATTRS{id/vendor}=="1234", ATTRS{id/product}=="9950", ATTRS{id/bustype}=="0003", RUN+="@SETFACL@ -m u:@USER@:r /dev/input/%k"
