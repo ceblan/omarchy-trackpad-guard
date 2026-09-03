@@ -102,7 +102,15 @@ quoted_trackpad_name="${quoted_trackpad_name//\"/\\\"}"
 
 set_trackpad_enabled() {
   local enabled="$1"
-  hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = $enabled })" >/dev/null
+  # Log every toggle: the journal is the source of truth when diagnosing
+  # reports of a stuck/missing cursor. A failure must stay fatal (nonzero
+  # return): the main loop dies, systemd restarts the unit and the defensive
+  # startup re-enable recovers the trackpad — never pretend success.
+  log "setting trackpad enabled=$enabled"
+  if ! hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = $enabled })" >/dev/null 2>&1; then
+    log "warning: failed to set trackpad enabled=$enabled (hyprctl eval)"
+    return 1
+  fi
 }
 
 # Defensive re-enable: a previous instance killed with SIGKILL may have left
