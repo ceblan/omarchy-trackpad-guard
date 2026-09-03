@@ -23,12 +23,12 @@ flowchart LR
 
 evdev is multi-reader: the guard watches the xremap node without interfering with Hyprland. The udev rule grants read access to that one keyboard node only (a second match in the same file covers the touchpad — see *How it works*). Unlike keyd's reserved `0fac:0ade` namespace, the `1234:9950` IDs are **not** an xremap constant — they are this machine's convention, set by `xremap.service` via `--vendor 0x1234 --product 0x9950 --output-device-name "xremap virtual keyboard"`. Port the flags, port the plugin.
 
-Verified on this stack (2026-09-03, captured from `event19`):
+Verified on this stack (2026-09-04, captured from `event19` with physical key presses):
 
 - Physical Ctrl emits `KEY_LEFTCTRL` — the modifier exception works.
-- Caps held emits `KEY_LEFTSHIFT` (this machine's kmonad config); Caps tapped emits `KEY_ESC`. Both are treated as modifier/navigation keys by the guard.
-- xremap remaps arrive as their target keys: `Ctrl+n` → `KEY_DOWN`, `Ctrl+p` → `KEY_UP`, `Ctrl+a` → `KEY_HOME`, `Ctrl+e` → `KEY_END`, so navigation remaps re-enable the trackpad immediately.
-- A held key emits a stream of `value 2` autorepeat events, so holding a text key keeps the trackpad disabled continuously. Verified configuration: kmonad ≥0.4.4 (this machine runs 0.4.5), whose uinput node advertises `EV_REP`; xremap forwards the repeat events.
+- Caps tapped emits `KEY_ESC`; Caps held while pressing another key emits `KEY_LEFTCTRL` (this machine's kmonad config, `tap-next esc lctl`), so e.g. Caps+A flows on as `Ctrl+a`. Both outcomes are treated as navigation/modifier keys by the guard.
+- xremap remaps arrive as their target keys: `Ctrl+n` → `KEY_DOWN`, `Ctrl+p` → `KEY_UP`, `Ctrl+a` → `KEY_HOME`, `Ctrl+e` → `KEY_END` (with the modifier suppressed for the remapped key and restored after), so navigation remaps release the grab immediately.
+- A held key emits a stream of `value 2` autorepeat events, so holding a text key keeps the trackpad grabbed continuously. Verified configuration: kmonad ≥0.4.4 (this machine runs 0.4.5), whose uinput node advertises `EV_REP`; xremap forwards the repeat events.
 
 If the stack is removed (no kmonad/xremap), this plugin is **not** a constants-only change — see *Compatibility*.
 
