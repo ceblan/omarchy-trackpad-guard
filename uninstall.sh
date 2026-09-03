@@ -4,18 +4,18 @@ set -Eeuo pipefail
 
 TARGET_BIN="$HOME/.local/bin/omarchy-trackpad-guard"
 AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
-RULE_PATH="/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
+RULE_PATH="/etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules"
 UNIT_PATH="$HOME/.config/systemd/user/omarchy-trackpad-guard.service"
 MARKER_START="-- omarchy-trackpad-guard:start"
 MARKER_END="-- omarchy-trackpad-guard:end"
 CURRENT_USER="$(id -un)"
 
-# Match constants for the keyd virtual keyboard. Keep in sync with
+# Match constants for the xremap virtual keyboard. Keep in sync with
 # bin/omarchy-trackpad-guard, install.sh and rules/*.rules.in —
 # `make check` enforces they stay identical.
-KEYBOARD_NAME="keyd virtual keyboard"
-KEYBOARD_VENDOR="0fac"
-KEYBOARD_PRODUCT="0ade"
+KEYBOARD_NAME="xremap virtual keyboard"
+KEYBOARD_VENDOR="1234"
+KEYBOARD_PRODUCT="9950"
 KEYBOARD_BUSTYPE="0003"
 
 if (( EUID == 0 )); then
@@ -122,10 +122,11 @@ if [[ -f "$AUTOSTART_FILE" ]]; then
   install -m644 "$temp_autostart" "$AUTOSTART_FILE"
 fi
 
+matched_sysnames=()
 for event_path in /sys/class/input/event*; do
   [[ -e "$event_path" ]] || continue
   input_path="$(readlink -f "$event_path/device")"
-  # Only the keyd uinput node can hold our ACL; it lives under
+  # Only the xremap uinput node can hold our ACL; it lives under
   # /sys/devices/virtual.
   case "$input_path" in
     /sys/devices/virtual/*) ;;
@@ -144,11 +145,26 @@ for event_path in /sys/class/input/event*; do
     if ! getfacl "$keyboard_node" 2>/dev/null | grep -Eq '^(user|group):[^:]'; then
       sudo setfacl -b "$keyboard_node" 2>/dev/null || true
     fi
+    matched_sysnames+=("${event_path##*/}")
   fi
 done
 
 sudo rm -f -- "$RULE_PATH"
 sudo udevadm control --reload-rules
+
+# Other rules may legitimately match the same node and set ACLs of their own
+# (on this machine, voxtype's 99-kmonad-virtual-keyboard-voxtype-acl.rules
+# grants the same user read access). Our setfacl -x/-b above stripped them,
+# so re-trigger the node now — AFTER our own rule is gone, or it would just
+# re-add the ACL we removed: any remaining rule re-fires on the change event
+# and restores its ACL, leaving the node as it was before this plugin was
+# ever installed. settle keeps the outcome deterministic for the operator.
+if (( ${#matched_sysnames[@]} > 0 )); then
+  for sysname in "${matched_sysnames[@]}"; do
+    sudo udevadm trigger --action=change --subsystem-match=input --sysname-match="$sysname" 2>/dev/null || true
+  done
+  sudo udevadm settle 2>/dev/null || true
+fi
 rm -f -- "$TARGET_BIN"
 rm -f -- "$pid_file" "${XDG_RUNTIME_DIR:-/tmp}/omarchy-trackpad-guard-${UID}.lock"
 
@@ -160,3 +176,4 @@ if [[ -n "$trackpad_name" && "$trackpad_name" != *[[:cntrl:]]* ]]; then
 fi
 
 printf 'Omarchy Trackpad Guard was removed (systemd unit, udev rule, ACL and binary). The evtest and acl packages were left installed.\n'
+printf 'Note: coexisting udev rules (e.g. voxtype'\''s) may have re-applied their own ACL on the xremap node via the re-trigger — expected and correct.\n'
