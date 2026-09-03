@@ -195,9 +195,23 @@ systemctl --user daemon-reload
 systemctl --user enable omarchy-trackpad-guard.service
 systemctl --user restart omarchy-trackpad-guard.service
 
+# Shell bar-widget plugin (bar icon + control panel). User-level and
+# best-effort: the guard above is the critical part.
+PLUGIN_ID="ceblan.trackpad-guard"
+PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+if [[ -f "$SCRIPT_DIR/shell-plugin/manifest.json" ]] && command -v omarchy-shell >/dev/null 2>&1; then
+  mkdir -p "$HOME/.config/omarchy/plugins"
+  rm -rf "$PLUGIN_DIR"
+  cp -a "$SCRIPT_DIR/shell-plugin" "$PLUGIN_DIR"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  omarchy plugin enable "$PLUGIN_ID" >/dev/null 2>&1 \
+    || printf 'install: note: could not enable the shell plugin; run: omarchy plugin enable %s\n' "$PLUGIN_ID"
+fi
+
 printf '\nInstalled Omarchy Trackpad Guard.\n'
 printf '  Guard:  %s\n' "$TARGET_BIN"
 printf '  Rule:   %s\n' "$RULE_PATH"
 printf '  Unit:   %s\n' "$HOME/.config/systemd/user/omarchy-trackpad-guard.service"
+printf '  Panel:  %s (bar icon)\n' "$PLUGIN_DIR"
 printf 'The trackpad now stays disabled until typing has been idle for 1 second.\n'
 printf 'Check it with: systemctl --user status omarchy-trackpad-guard\n'

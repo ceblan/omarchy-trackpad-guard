@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ceblan.trackpad-guard",
+  "name": "Trackpad Guard",
+  "version": "1.0.0",
+  "author": "ceblan",
+  "license": "MIT",
+  "description": "Bar icon and control panel for omarchy-trackpad-guard: daemon toggle, tap-to-click and typing-idle timeout.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Trackpad Guard",
+    "description": "Disable the touchpad while typing; control the guard daemon, tap-to-click and idle timeout.",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -90,9 +90,22 @@ if [[ -e "$lock_file" ]]; then
   fi
 fi
 
-# Stop sequence complete; now remove the unit files.
+# Stop sequence complete; now remove the unit files and any timeout drop-in
+# created by the shell panel's slider, so a nondefault timeout cannot leak
+# into a later reinstall.
 rm -f -- "$UNIT_PATH"
+rm -f -- "${UNIT_PATH}.d/override.conf"
+rmdir -- "${UNIT_PATH}.d" 2>/dev/null || true
 systemctl --user daemon-reload 2>/dev/null || true
+
+# Remove the shell bar-widget plugin (best-effort).
+PLUGIN_ID="ceblan.trackpad-guard"
+PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+if [[ -d "$PLUGIN_DIR" ]]; then
+  command -v omarchy >/dev/null 2>&1 && omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  rm -rf "$PLUGIN_DIR"
+  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+fi
 
 # Defensive: strip any leftover marked autostart block from the Apple-era
 # version (a no-op on clean machines).
