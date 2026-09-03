@@ -4,7 +4,12 @@ set -Eeuo pipefail
 
 TARGET_BIN="$HOME/.local/bin/omarchy-trackpad-guard"
 AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
-RULE_PATH="/etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules"
+RULE_PATH="/etc/udev/rules.d/99-trackpad-guard-acl.rules"
+# Legacy rule names from previous versions, also removed defensively.
+LEGACY_RULE_PATHS=(
+  "/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
+  "/etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules"
+)
 UNIT_PATH="$HOME/.config/systemd/user/omarchy-trackpad-guard.service"
 MARKER_START="-- omarchy-trackpad-guard:start"
 MARKER_END="-- omarchy-trackpad-guard:end"
@@ -149,7 +154,32 @@ for event_path in /sys/class/input/event*; do
   fi
 done
 
+# The touchpad node holds the second ACL (the guard grabs it while typing).
+# Resolve it the same way the guard does: omarchy-hw-touchpad prints the
+# Hyprland name, the sysfs name lowercased with spaces as dashes.
+touchpad_hypr_name="$(omarchy-hw-touchpad 2>/dev/null || true)"
+if [[ -n "$touchpad_hypr_name" && "$touchpad_hypr_name" != *[[:cntrl:]]* ]]; then
+  for event_path in /sys/class/input/event*; do
+    [[ -e "$event_path" && -r "$event_path/device/name" ]] || continue
+    candidate="$(<"$event_path/device/name")"
+    normalized="${candidate,,}"
+    normalized="${normalized// /-}"
+    if [[ "$normalized" == "$touchpad_hypr_name" ]]; then
+      touchpad_node="/dev/input/${event_path##*/}"
+      sudo setfacl -x "u:$CURRENT_USER" "$touchpad_node" 2>/dev/null || true
+      if ! getfacl "$touchpad_node" 2>/dev/null | grep -Eq '^(user|group):[^:]'; then
+        sudo setfacl -b "$touchpad_node" 2>/dev/null || true
+      fi
+      matched_sysnames+=("${event_path##*/}")
+      break
+    fi
+  done
+fi
+
 sudo rm -f -- "$RULE_PATH"
+for legacy_rule in "${LEGACY_RULE_PATHS[@]}"; do
+  sudo rm -f -- "$legacy_rule"
+done
 sudo udevadm control --reload-rules
 
 # Other rules may legitimately match the same node and set ACLs of their own
