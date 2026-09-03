@@ -5,18 +5,18 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_BIN="$HOME/.local/bin/omarchy-trackpad-guard"
 AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
-RULE_TEMPLATE="$SCRIPT_DIR/rules/99-keyd-virtual-keyboard-trackpad-guard.rules.in"
-RULE_PATH="/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
+RULE_TEMPLATE="$SCRIPT_DIR/rules/99-xremap-virtual-keyboard-trackpad-guard.rules.in"
+RULE_PATH="/etc/udev/rules.d/99-xremap-virtual-keyboard-trackpad-guard.rules"
 MARKER_START="-- omarchy-trackpad-guard:start"
 MARKER_END="-- omarchy-trackpad-guard:end"
 CURRENT_USER="$(id -un)"
 
-# Match constants for the keyd virtual keyboard. Keep in sync with
+# Match constants for the xremap virtual keyboard. Keep in sync with
 # bin/omarchy-trackpad-guard, uninstall.sh and rules/*.rules.in —
 # `make check` enforces they stay identical.
-KEYBOARD_NAME="keyd virtual keyboard"
-KEYBOARD_VENDOR="0fac"
-KEYBOARD_PRODUCT="0ade"
+KEYBOARD_NAME="xremap virtual keyboard"
+KEYBOARD_VENDOR="1234"
+KEYBOARD_PRODUCT="9950"
 KEYBOARD_BUSTYPE="0003"
 
 die() {
@@ -47,9 +47,14 @@ for command_name in omarchy sudo udevadm omarchy-hw-touchpad systemctl pgrep flo
   command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"
 done
 
-# keyd is a hard dependency: the guard reads keyd's virtual keyboard, which
-# only exists while keyd is running.
-systemctl is-active --quiet keyd || die "keyd.service is not active; the guard reads keyd's virtual keyboard — start/enable keyd first (see README)"
+# xremap is a hard dependency in practice — without its virtual keyboard
+# there is no readable keyboard node — but the discovery loop below already
+# dies when the node is absent, so here we only warn: the source of truth is
+# "the node exists and is readable", not the service name. This also keeps
+# the installer working on stack variants (e.g. xremap launched differently).
+if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet xremap; then
+  printf 'install: warning: xremap.service is not active; the xremap virtual keyboard may not exist\n' >&2
+fi
 
 if ! command -v evtest >/dev/null 2>&1; then
   printf 'Installing evtest through Omarchy...\n'
@@ -75,13 +80,24 @@ trap cleanup EXIT
 
 sed -e "s|@SETFACL@|$SETFACL_PATH|g" -e "s|@USER@|$CURRENT_USER|g" "$RULE_TEMPLATE" > "$temp_rule"
 sudo install -Dm644 "$temp_rule" "$RULE_PATH"
+
+# Defensive migration from the keyd-era version: remove the legacy rule name
+# if a previous install left it behind (a no-op on clean machines). Leaving
+# it would keep an ACL on a node that no longer exists and duplicate matches
+# if the stack ever moved back.
+LEGACY_RULE_PATH="/etc/udev/rules.d/99-keyd-virtual-keyboard-trackpad-guard.rules"
+if [[ -f "$LEGACY_RULE_PATH" ]]; then
+  sudo rm -f -- "$LEGACY_RULE_PATH"
+  printf 'Removed legacy keyd-era udev rule: %s\n' "$LEGACY_RULE_PATH"
+fi
+
 sudo udevadm control --reload-rules
 
 keyboard_sysname=""
 for event_path in /sys/class/input/event*; do
   [[ -e "$event_path" ]] || continue
   input_path="$(readlink -f "$event_path/device")"
-  # The event source IS keyd's uinput node: it must live under
+  # The event source IS xremap's uinput node: it must live under
   # /sys/devices/virtual. A physical device spoofing these IDs is rejected.
   case "$input_path" in
     /sys/devices/virtual/*) ;;
@@ -97,7 +113,7 @@ for event_path in /sys/class/input/event*; do
   fi
 done
 
-[[ -n "$keyboard_sysname" ]] || die "could not find the keyd virtual keyboard event device (is keyd running?)"
+[[ -n "$keyboard_sysname" ]] || die "could not find the xremap virtual keyboard event device (is xremap running?)"
 sudo udevadm trigger --action=change --subsystem-match=input --sysname-match="$keyboard_sysname"
 
 # Do not rely on the guard's retry loop for the RUN+=setfacl race: wait for
