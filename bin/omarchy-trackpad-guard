@@ -16,7 +16,7 @@ KEYBOARD_PRODUCT="9950"
 KEYBOARD_BUSTYPE="0003"
 
 keyboard_event=""
-trackpad_disabled=false
+grab_active=false
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
 pid_file="$runtime_dir/omarchy-trackpad-guard-${UID}.pid"
 lock_file="$runtime_dir/omarchy-trackpad-guard-${UID}.lock"
@@ -102,27 +102,94 @@ fi
 quoted_trackpad_name="${trackpad_name//\\/\\\\}"
 quoted_trackpad_name="${quoted_trackpad_name//\"/\\\"}"
 
-set_trackpad_enabled() {
-  local enabled="$1"
-  # Log every toggle: the journal is the source of truth when diagnosing
-  # reports of a stuck/missing cursor. A failure must stay fatal (nonzero
-  # return): the main loop dies, systemd restarts the unit and the defensive
-  # startup re-enable recovers the trackpad — never pretend success.
-  log "setting trackpad enabled=$enabled"
-  if ! hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = $enabled })" >/dev/null 2>&1; then
-    log "warning: failed to set trackpad enabled=$enabled (hyprctl eval)"
+# The guard freezes the pointer by holding an exclusive evdev grab
+# (EVIOCGRAB via `evtest --grab`) on the touchpad node while text keys are
+# pressed — NOT by toggling hl.device(enabled=…). Each hl.device toggle
+# re-initializes the I2C HID device in Hyprland; doing that per typing burst
+# produced intermittent ghost contacts on the touchpad and stuck touch state
+# in Hyprland (+1 finger on every gesture until `hyprctl reload`), the
+# "dead trackpad" incident of 2026-09-04. An fd-bound grab costs nothing to
+# acquire/release and vanishes when the fd closes, so it cannot corrupt
+# device state.
+ensure_trackpad_enabled() {
+  # One-shot recovery from the pre-grab design: old versions toggled
+  # hl.device(enabled=false) and a SIGKILL could leave the touchpad dead in
+  # Hyprland. A single re-enable at startup/exit (no touch in flight) is
+  # safe — unlike the per-burst toggles that caused the incident above.
+  log "ensuring trackpad enabled=true in Hyprland (legacy-state recovery)"
+  if ! hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = true })" >/dev/null 2>&1; then
+    log "warning: failed to set trackpad enabled=true (hyprctl eval)"
     return 1
   fi
 }
 
-# Defensive re-enable: a previous instance killed with SIGKILL may have left
-# the trackpad disabled, so every start (including systemd restarts) first
-# recovers a known enabled state.
-set_trackpad_enabled true 2>/dev/null || true
+# Resolve the touchpad's /dev/input/eventNN node fresh before every grab:
+# event numbers change across re-enumeration. Hyprland device names are the
+# sysfs input name lowercased with spaces turned into dashes, which also
+# disambiguates the twin "ASUF1208:00 2808:0218 Mouse" interface (its
+# normalized name ends in -mouse, ours in -touchpad).
+touchpad_event_node() {
+  local event_path name normalized
+  for event_path in /sys/class/input/event*; do
+    [[ -e "$event_path" && -r "$event_path/device/name" ]] || continue
+    name="$(<"$event_path/device/name")"
+    normalized="${name,,}"
+    normalized="${normalized// /-}"
+    if [[ "$normalized" == "$trackpad_name" ]]; then
+      printf '%s\n' "/dev/input/${event_path##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+grab_pid=""
+grab_watchdog_pid=""
+
+grab_touchpad() {
+  local node
+  if ! node="$(touchpad_event_node)"; then
+    log "warning: touchpad event node not found; leaving pointer active"
+    return 0
+  fi
+  if [[ ! -r "$node" ]]; then
+    log "warning: $node is not readable (udev ACL missing?); leaving pointer active"
+    return 0
+  fi
+  evtest --grab "$node" >/dev/null 2>&1 &
+  grab_pid=$!
+  # Watchdog: the grab fd lives in the evtest child, not in the guard, so an
+  # orphaned child would freeze the touchpad indefinitely. If the guard dies
+  # without running cleanup (SIGKILL on a manual launch), the watchdog kills
+  # the grabber and the kernel releases the grab with the fd. $$ inside the
+  # subshell still expands to the guard's PID (bash keeps $$ in subshells).
+  # Under systemd this is a second net behind KillMode=control-group, which
+  # reaps the whole cgroup when the unit stops or restarts.
+  ( while kill -0 $$ 2>/dev/null; do sleep 0.3; done; kill "$grab_pid" 2>/dev/null ) &
+  grab_watchdog_pid=$!
+  log "grabbed $node (exclusive evdev grab while typing)"
+}
+
+release_touchpad() {
+  [[ -n "$grab_pid" ]] || return 0
+  kill "$grab_pid" 2>/dev/null || true
+  wait "$grab_pid" 2>/dev/null || true
+  grab_pid=""
+  kill "$grab_watchdog_pid" 2>/dev/null || true
+  wait "$grab_watchdog_pid" 2>/dev/null || true
+  grab_watchdog_pid=""
+  log "released touchpad grab"
+}
+
+# Defensive re-enable: versions before the grab design could leave the
+# trackpad disabled in Hyprland, so every start (including systemd restarts)
+# first recovers a known enabled state.
+ensure_trackpad_enabled 2>/dev/null || true
 
 cleanup() {
   trap - EXIT INT TERM HUP
-  set_trackpad_enabled true 2>/dev/null || true
+  release_touchpad
+  ensure_trackpad_enabled 2>/dev/null || true
   rm -f -- "$pid_file"
 }
 
@@ -147,7 +214,7 @@ if [[ ! -c "$keyboard_event" || ! -r "$keyboard_event" ]]; then
   exit 1
 fi
 
-log "monitoring ${keyboard_event} (${KEYBOARD_NAME}); controlling ${trackpad_name}; trackpad timeout is ${TIMEOUT_SECONDS}s"
+log "monitoring ${keyboard_event} (${KEYBOARD_NAME}); grabbing ${trackpad_name} while typing; idle release is ${TIMEOUT_SECONDS}s"
 
 declare -A held_modifiers=()
 
@@ -179,11 +246,11 @@ evtest_pid="$KEY_EVENTS_PID"
 
 while true; do
   line=""
-  if $trackpad_disabled; then
+  if $grab_active; then
     if ! IFS= read -r -t "$TIMEOUT_SECONDS" line <&"$events_fd"; then
       if kill -0 "$evtest_pid" 2>/dev/null; then
-        set_trackpad_enabled true
-        trackpad_disabled=false
+        release_touchpad
+        grab_active=false
         continue
       fi
       break
@@ -207,9 +274,9 @@ while true; do
       unset 'held_modifiers[$key]'
     else
       held_modifiers["$key"]=1
-      if $trackpad_disabled; then
-        set_trackpad_enabled true
-        trackpad_disabled=false
+      if $grab_active; then
+        release_touchpad
+        grab_active=false
       fi
     fi
     continue
@@ -218,13 +285,13 @@ while true; do
   [[ "$value" != "0" ]] || continue
 
   if (( ${#held_modifiers[@]} > 0 )) || is_navigation_key "$key"; then
-    if $trackpad_disabled; then
-      set_trackpad_enabled true
-      trackpad_disabled=false
+    if $grab_active; then
+      release_touchpad
+      grab_active=false
     fi
-  elif ! $trackpad_disabled; then
-    set_trackpad_enabled false
-    trackpad_disabled=true
+  elif ! $grab_active; then
+    grab_touchpad
+    grab_active=true
   fi
 done
 
