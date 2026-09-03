@@ -15,7 +15,7 @@ On this machine the physical keyboard (`ITE Tech. Inc. ITE Device(8910)`, `0b05:
 ```mermaid
 flowchart LR
     A["event5<br>ITE keyboard (physical)<br>0b05:19b6"] -->|EVIOCGRAB| B["kmonad"]
-    B --> C["event18 \"name\"<br>kmonad uinput<br>1235:5679"]
+    B --> C["event18 #quot;name#quot;<br>kmonad uinput<br>1235:5679"]
     C -->|EVIOCGRAB| D["keyd"]
     D --> E["event19<br>keyd virtual keyboard<br>0fac:0ade"]
     E --> F["guard (ACL read-only)<br>+ libinput/Hyprland"]
@@ -53,6 +53,8 @@ Running `./install.sh` again safely updates the installation. A previous guard i
 ## The bar panel
 
 Click the trackpad icon in the Omarchy bar to open the panel:
+
+![Trackpad Guard bar panel overlay](assets/trackpad-guard-overlay.png)
 
 - **Daemon switch** — starts/stops `omarchy-trackpad-guard.service` (`systemctl --user`).
 - **Tap to click switch** — flips `tap_to_click` in `~/.config/hypr/input.lua` and reloads Hyprland, so the change is immediate and persistent. (The Lua config parser refuses `hyprctl keyword`; editing the file + `hyprctl reload` is the supported path.)
