@@ -94,12 +94,18 @@ Hyprland's built-in `disable_while_typing` may release the trackpad sooner than 
 
 **Why a grab instead of `hl.device(enabled=…)`:** an earlier version of this plugin toggled the Hyprland device per typing burst. Each toggle re-initializes the I2C HID device; under real use this produced intermittent ghost contacts on the untouched touchpad and stuck touch state in Hyprland (every gesture needed one extra finger until `hyprctl reload`) — the "dead trackpad" incident of 2026-09-04. An fd-bound grab costs nothing to acquire or release, never re-initializes the device, and disappears automatically when the fd closes. A watchdog kills the grabber if the guard is `SIGKILL`-ed outside systemd, and systemd's default `KillMode=control-group` reaps it on unit stop/restart, so a dead guard can never leave the touchpad frozen.
 
+**Why releases are gated on pad state:** while the grab is held, libinput is blind to the touchpad. A contact (typically a palm) that *begins* during that window never delivers its DOWN event; releasing mid-contact would hand libinput an already-active `TRACKING_ID`, which it counts as a new, unclassified touch — a ghost finger, +1 on every gesture until the contact physically ends (the 2026-09-05 incident; the old toggle design had the same defect, because device-off is equally blind). The grabber coprocess still receives every touch event, so the guard tracks `BTN_TOUCH` and defers every release — idle timeout, modifier/navigation, and exit — until the last contact lifts, with a 5 s safety cap (a warning is logged and the grab released anyway: a transient ghost in that rare case beats a frozen pad). Contacts that began *before* the grab need no gating: libinput saw and palm-classified their DOWN before going blind. (Native `disable_while_typing` avoids all this by being event-transparent: libinput always sees every contact and classifies palms itself.)
+
+Tradeoff, by design: if you type with a palm resting on the pad and try to gesture *without lifting it*, the pad stays suppressed until you lift the palm (5 s cap at most). That is consistent with palm rejection, just stricter than native DWT.
+
 The trackpad is grabbed only for ordinary text-key presses. The grab is released:
 
 - after the configured idle timeout;
 - immediately for modifier keys and navigation keys (including remaps that emit navigation keys, e.g. `Ctrl+a` → Home);
 - whenever the guard exits, including `SIGINT`, `SIGTERM`, logout, or a keyboard event-stream failure (fd close releases the grab); and
-- a one-shot `hl.device(enabled=true)` runs at every start and exit, purely to recover from state left by pre-grab versions — never per keystroke.
+- in every case above, only once the pad is clean — a release is deferred while a contact that began during the grab is still active (journal: `release deferred, pad dirty`), with a 5 s cap.
+
+A one-shot `hl.device(enabled=true)` also runs at every start and exit, purely to recover from state left by pre-grab versions — never per keystroke.
 
 Every grab/release is logged to the journal (`journalctl --user -u omarchy-trackpad-guard`).
 
