@@ -145,6 +145,9 @@ touchpad_event_node() {
 
 grab_pid=""
 grab_watchdog_pid=""
+tp_events_fd=""
+pad_dirty=false
+defer_deadline=""
 
 grab_touchpad() {
   local node
@@ -156,8 +159,15 @@ grab_touchpad() {
     log "warning: $node is not readable (udev ACL missing?); leaving pointer active"
     return 0
   fi
-  evtest --grab "$node" >/dev/null 2>&1 &
-  grab_pid=$!
+  # The grabber is a named coproc (not >/dev/null): its stream IS the pad
+  # state. The grab is exclusive, so every touch event is delivered here —
+  # letting the guard see contacts that begin while libinput is blind.
+  coproc TP_GRAB { exec stdbuf -oL -eL evtest --grab "$node" 2>/dev/null; }
+  grab_pid="$TP_GRAB_PID"
+  tp_events_fd="${TP_GRAB[0]}"
+  exec {TP_GRAB[1]}>&-  # we never write to the grabber
+  pad_dirty=false
+  defer_deadline=""
   # Watchdog: the grab fd lives in the evtest child, not in the guard, so an
   # orphaned child would freeze the touchpad indefinitely. If the guard dies
   # without running cleanup (SIGKILL on a manual launch), the watchdog kills
@@ -170,6 +180,25 @@ grab_touchpad() {
   log "grabbed $node (exclusive evdev grab while typing)"
 }
 
+# Track pad state from the grabber's stream. BTN_TOUCH 1/0 bracket the
+# first/last contact. Contacts that began BEFORE the grab never emit a 1 to
+# us — and they are safe anyway: libinput saw and palm-classified their DOWN
+# before going blind. The dangerous case is a contact that begins DURING the
+# grab, and that one always arrives here as a value 1.
+drain_touchpad() {
+  local tp_line
+  [[ -n "$tp_events_fd" ]] || return 0
+  # `read -t 0` never assigns — it only probes availability; the plain read
+  # right after consumes the line. Single reader, so no race between them.
+  while IFS= read -r -t 0 _probe <&"$tp_events_fd"; do
+    IFS= read -r tp_line <&"$tp_events_fd" || break
+    case "$tp_line" in
+      *"code 330 (BTN_TOUCH), value 1") pad_dirty=true ;;
+      *"code 330 (BTN_TOUCH), value 0") pad_dirty=false ;;
+    esac
+  done
+}
+
 release_touchpad() {
   [[ -n "$grab_pid" ]] || return 0
   kill "$grab_pid" 2>/dev/null || true
@@ -178,7 +207,38 @@ release_touchpad() {
   kill "$grab_watchdog_pid" 2>/dev/null || true
   wait "$grab_watchdog_pid" 2>/dev/null || true
   grab_watchdog_pid=""
+  if [[ -n "$tp_events_fd" ]]; then
+    exec {tp_events_fd}<&-
+    tp_events_fd=""
+  fi
   log "released touchpad grab"
+}
+
+# Gate every release on pad state. Releasing while a contact that began
+# during the grab is still active would hand libinput an already-open
+# TRACKING_ID it never saw go down: it counts it as a new, unclassified
+# touch — a ghost finger, +1 on every gesture until the contact physically
+# ends (the 2026-09-05 "+1 finger" incident). Defer until the pad is clean,
+# with a 5s cap: a permanent freeze is worse than a transient ghost in that
+# rare case. Returns 0 when the grab was released, 1 when deferred.
+attempt_release() {
+  $grab_active || return 0
+  drain_touchpad
+  if $pad_dirty; then
+    if [[ -z "$defer_deadline" ]]; then
+      defer_deadline=$(( $(date +%s) + 5 ))
+      log "release deferred, pad dirty (contact began during grab)"
+      return 1
+    elif (( $(date +%s) < defer_deadline )); then
+      return 1
+    fi
+    log "warning: pad still dirty after 5s cap; forcing release"
+  fi
+  release_touchpad
+  grab_active=false
+  pad_dirty=false
+  defer_deadline=""
+  return 0
 }
 
 # Defensive re-enable: versions before the grab design could leave the
@@ -188,6 +248,17 @@ ensure_trackpad_enabled 2>/dev/null || true
 
 cleanup() {
   trap - EXIT INT TERM HUP
+  # The exit path is a release like any other and gets the same dirty-pad
+  # gating, bounded by the same 5s cap so shutdown can never get stuck.
+  if $grab_active; then
+    local deadline=$(( $(date +%s) + 5 ))
+    drain_touchpad
+    while $pad_dirty && (( $(date +%s) < deadline )); do
+      sleep 0.1
+      drain_touchpad
+    done
+    $pad_dirty && log "warning: pad still dirty at exit after 5s cap; forcing release"
+  fi
   release_touchpad
   ensure_trackpad_enabled 2>/dev/null || true
   rm -f -- "$pid_file"
@@ -247,13 +318,16 @@ evtest_pid="$KEY_EVENTS_PID"
 while true; do
   line=""
   if $grab_active; then
-    if ! IFS= read -r -t "$TIMEOUT_SECONDS" line <&"$events_fd"; then
-      if kill -0 "$evtest_pid" 2>/dev/null; then
-        release_touchpad
-        grab_active=false
-        continue
+    # While a release is deferred (dirty pad) poll at 0.1s so a palm lift is
+    # seen promptly; otherwise the keyboard read timeout IS the idle release.
+    read_timeout="$TIMEOUT_SECONDS"
+    [[ -n "$defer_deadline" ]] && read_timeout="0.1"
+    if ! IFS= read -r -t "$read_timeout" line <&"$events_fd"; then
+      if ! kill -0 "$evtest_pid" 2>/dev/null; then
+        break
       fi
-      break
+      attempt_release
+      continue
     fi
   elif ! IFS= read -r line <&"$events_fd"; then
     break
@@ -274,10 +348,7 @@ while true; do
       unset 'held_modifiers[$key]'
     else
       held_modifiers["$key"]=1
-      if $grab_active; then
-        release_touchpad
-        grab_active=false
-      fi
+      attempt_release
     fi
     continue
   fi
@@ -285,10 +356,7 @@ while true; do
   [[ "$value" != "0" ]] || continue
 
   if (( ${#held_modifiers[@]} > 0 )) || is_navigation_key "$key"; then
-    if $grab_active; then
-      release_touchpad
-      grab_active=false
-    fi
+    attempt_release
   elif ! $grab_active; then
     grab_touchpad
     grab_active=true
