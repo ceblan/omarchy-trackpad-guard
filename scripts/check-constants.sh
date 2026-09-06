@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Asserts that the keyboard match constants stay in sync across
-# bin/omarchy-trackpad-guard, install.sh, uninstall.sh and the udev rule
-# template, that their format is safe for udev/sed interpolation, and that
-# the rendered rule passes `udevadm verify`. Runs without sudo.
+# bin/omarchy-trackpad-guard (doctor), install.sh, uninstall.sh and the
+# libinput quirks template, that their format is safe, and that the rendered
+# quirks section is well-formed. Runs without sudo.
 
 set -Eeuo pipefail
 
@@ -35,9 +35,9 @@ for var in KEYBOARD_NAME KEYBOARD_VENDOR KEYBOARD_PRODUCT KEYBOARD_BUSTYPE; do
   printf -v "SYNCED_$var" '%s' "$reference"
 done
 
-# Format validation (same rules the guard and installer enforce at runtime):
-# hex IDs must be 4 lowercase-hex digits; the name must not contain control
-# characters or characters that udev/sed interpret (globs, quotes, |, &, \).
+# Format validation: hex IDs must be 4 hex digits; the name must not contain
+# control characters or characters that udev/quirks/sed interpret (globs,
+# quotes, |, &, \).
 for var in KEYBOARD_VENDOR KEYBOARD_PRODUCT KEYBOARD_BUSTYPE; do
   value="$(eval printf '%s' \"\$SYNCED_$var\")"
   [[ "${value,,}" =~ ^[0-9a-f]{4}$ ]] || fail "$var must be 4 hex digits, got: $value"
@@ -46,18 +46,41 @@ forbidden_name_chars='[][:cntrl:]"\\|&*?[]'
 [[ -n "$SYNCED_KEYBOARD_NAME" && ! "$SYNCED_KEYBOARD_NAME" =~ $forbidden_name_chars ]] \
   || fail "KEYBOARD_NAME is empty or contains forbidden characters"
 
-templates=(rules/*.rules.in)
-[[ ${#templates[@]} -eq 1 && -f "${templates[0]}" ]] || fail "expected exactly one rules/*.rules.in template"
+templates=(quirks/*.quirks.in)
+[[ ${#templates[@]} -eq 1 && -f "${templates[0]}" ]] || fail "expected exactly one quirks/*.quirks.in template"
 template="${templates[0]}"
 
-grep -Fq "ATTRS{name}==\"$SYNCED_KEYBOARD_NAME\"" "$template" || fail "$template lacks exact ATTRS{name} match"
-grep -Fq "ATTRS{id/vendor}==\"$SYNCED_KEYBOARD_VENDOR\"" "$template" || fail "$template lacks exact ATTRS{id/vendor} match"
-grep -Fq "ATTRS{id/product}==\"$SYNCED_KEYBOARD_PRODUCT\"" "$template" || fail "$template lacks exact ATTRS{id/product} match"
-grep -Fq "ATTRS{id/bustype}==\"$SYNCED_KEYBOARD_BUSTYPE\"" "$template" || fail "$template lacks exact ATTRS{id/bustype} match"
+# The template must carry the sentinels, the section named after the
+# (capitalized) keyboard, the placeholders, and the pairing attribute.
+grep -Fq '# >>> omarchy-trackpad-guard' "$template" || fail "$template lacks the opening sentinel"
+grep -Fq '# <<< omarchy-trackpad-guard' "$template" || fail "$template lacks the closing sentinel"
+section_name="${SYNCED_KEYBOARD_NAME^}"
+grep -Fq "[$section_name]" "$template" || fail "$template section header must be [$section_name]"
+grep -Fq 'MatchName=@XREMAP_NAME@' "$template" || fail "$template lacks the @XREMAP_NAME@ placeholder"
+grep -Fq 'MatchVendor=0x@XREMAP_VENDOR@' "$template" || fail "$template lacks the @XREMAP_VENDOR@ placeholder"
+grep -Fq 'MatchProduct=0x@XREMAP_PRODUCT@' "$template" || fail "$template lacks the @XREMAP_PRODUCT@ placeholder"
+grep -Fq 'AttrKeyboardIntegration=internal' "$template" || fail "$template lacks AttrKeyboardIntegration=internal"
 
-rendered="$(mktemp --suffix=.rules)"
+# Render exactly like install.sh does and validate the result statically.
+rendered="$(mktemp)"
 trap 'rm -f -- "$rendered"' EXIT
-sed -e "s|@SETFACL@|/usr/bin/setfacl|g" -e "s|@USER@|dummyuser|g" "$template" > "$rendered"
-udevadm verify "$rendered" >/dev/null || fail "udevadm verify rejected the rendered rule"
+sed -e "s|@XREMAP_NAME@|$SYNCED_KEYBOARD_NAME|g" \
+    -e "s|@XREMAP_VENDOR@|$SYNCED_KEYBOARD_VENDOR|g" \
+    -e "s|@XREMAP_PRODUCT@|$SYNCED_KEYBOARD_PRODUCT|g" \
+    "$template" > "$rendered"
 
-printf 'check-constants: constants in sync, template matches, rendered rule verifies\n'
+grep -Eq "^MatchVendor=0x[0-9a-fA-F]{4}$" "$rendered" || fail "rendered MatchVendor is not 0x%04X"
+grep -Eq "^MatchProduct=0x[0-9a-fA-F]{4}$" "$rendered" || fail "rendered MatchProduct is not 0x%04X"
+grep -Fxq "MatchName=$SYNCED_KEYBOARD_NAME" "$rendered" || fail "rendered MatchName mismatch"
+grep -Fxq 'MatchUdevType=keyboard' "$rendered" || fail "rendered quirk lacks MatchUdevType=keyboard"
+grep -Fxq 'MatchBus=usb' "$rendered" || fail "rendered quirk lacks MatchBus=usb"
+grep -Fxq 'AttrKeyboardIntegration=internal' "$rendered" || fail "rendered quirk lacks AttrKeyboardIntegration=internal"
+
+# libinput 1.31 does not ship a `libinput quirks validate` in PATH on Arch;
+# if it ever appears, prefer the real validator over the static checks.
+if command -v libinput >/dev/null 2>&1; then
+  libinput quirks validate "$rendered" >/dev/null 2>&1 \
+    || fail "libinput quirks validate rejected the rendered template"
+fi
+
+printf 'check-constants: constants in sync, quirks template renders and validates\n'

@@ -1,0 +1,25 @@
+# Managed section template for /etc/libinput/local-overrides.quirks.
+# Rendered by install.sh (sed) and checked by scripts/check-constants.sh.
+#
+# Without AttrKeyboardIntegration=internal on xremap's uinput node, libinput
+# does not pair it with the internal touchpad and native DWT never engages
+# (the physical keyboard is grabbed by kmonad -> xremap, so the virtual
+# keyboard is the only observable one). The quirk is read when libinput's
+# context is created at session start: after a change, log out and back in.
+#
+# The 1234:9950 IDs are this machine's xremap.service convention (its
+# --vendor/--product flags), not a reserved xremap namespace. Keep them in
+# sync with the unit; `make check` enforces coherence with install.sh and
+# uninstall.sh.
+
+# The section name is the capitalized keyboard name ([Xremap virtual
+# keyboard] for "xremap virtual keyboard"); check-constants.sh enforces it.
+# >>> omarchy-trackpad-guard (managed section; do not edit between markers)
+[Xremap virtual keyboard]
+MatchUdevType=keyboard
+MatchBus=usb
+MatchVendor=0x@XREMAP_VENDOR@
+MatchProduct=0x@XREMAP_PRODUCT@
+MatchName=@XREMAP_NAME@
+AttrKeyboardIntegration=internal
+# <<< omarchy-trackpad-guard
