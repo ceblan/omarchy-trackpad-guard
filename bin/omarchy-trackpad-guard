@@ -1,373 +1,1273 @@
 #!/usr/bin/env bash
+# omarchy-trackpad-guard — one-shot helper for the native-DWT design.
+#
+# No daemon, no evdev reads, no EVIOCGRAB, no systemd unit, no udev ACLs.
+# Palm rejection is libinput's native disable-while-typing; this helper only
+# reads/writes `disable_while_typing` and `tap_to_click` inside
+# hl.config->input->touchpad in ~/.config/hypr/input.lua, then applies the
+# change with `hyprctl reload` and verifies it with `hyprctl getoption`.
+#
+# usage:
+#   omarchy-trackpad-guard get [--json]
+#   omarchy-trackpad-guard set <dwt|tap> <on|off>
+#   omarchy-trackpad-guard doctor
+#
+# exit codes: 0 ok (incl. no-op) · 2 usage · 3 Hyprland unavailable ·
+# 4 input.lua not editable · 5 non-canonical grammar / duplicate / ambiguous ·
+# 6 concurrent external edit (or lock timeout) · 7 verification failed
+# (input.lua rolled back).
+#
+# Test-only override honored by `doctor` (mirrors install.sh/uninstall.sh):
+# OTG_ROOT / OTG_SYSFS_ROOT prefix /etc and /sys lookups when set.
 
 set -Eeuo pipefail
 
-TIMEOUT_SECONDS="${TRACKPAD_GUARD_TIMEOUT:-1.0}"
+VERSION="2.0.0"
+CONFIG_FILE="$HOME/.config/hypr/input.lua"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-trackpad-guard-${UID}.lock"
+QUIRKS_FILE="${OTG_ROOT:-}/etc/libinput/local-overrides.quirks"
+SYSFS_ROOT="${OTG_SYSFS_ROOT:-/sys}"
 
-# Match constants for the xremap virtual keyboard (this machine's only
-# observable keyboard node behind the kmonad→xremap grab chain; see README).
-# The 1234:9950 IDs are this machine's xremap.service convention (its
-# --vendor/--product flags), not a reserved xremap namespace.
-# Edit all four together with install.sh, uninstall.sh and rules/*.rules.in
-# if the remap stack changes — `make check` enforces they stay in sync.
+SENTINEL_START="# >>> omarchy-trackpad-guard (managed section; do not edit between markers)"
+SENTINEL_END="# <<< omarchy-trackpad-guard"
+
+# Match constants for the xremap virtual keyboard (this machine's
+# xremap.service convention via --vendor/--product/--output-device-name).
+# Used by `doctor` to detect the node under /sys/devices/virtual.
+# Keep in sync with install.sh, uninstall.sh and quirks/*.quirks.in —
+# `make check` enforces they stay identical.
 KEYBOARD_NAME="xremap virtual keyboard"
 KEYBOARD_VENDOR="1234"
 KEYBOARD_PRODUCT="9950"
 KEYBOARD_BUSTYPE="0003"
 
-keyboard_event=""
-grab_active=false
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
-pid_file="$runtime_dir/omarchy-trackpad-guard-${UID}.pid"
-lock_file="$runtime_dir/omarchy-trackpad-guard-${UID}.lock"
+SECTION_NAME="${KEYBOARD_NAME^}"
 
-log() {
-  printf 'trackpad-guard: %s\n' "$*"
+prog="omarchy-trackpad-guard"
+
+die() { # $1=exit-code $2=message
+  local code=$1
+  shift
+  printf '%s: %s\n' "$prog" "$*" >&2
+  exit "$code"
 }
 
-if [[ ! "$TIMEOUT_SECONDS" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || [[ "$TIMEOUT_SECONDS" =~ ^0*([.]0*)?$ ]]; then
-  log "TRACKPAD_GUARD_TIMEOUT must be a positive number"
-  exit 1
-fi
+usage() {
+  cat >&2 <<USAGE
+usage: $prog get [--json]
+       $prog set <dwt|tap> <on|off>
+       $prog doctor
+USAGE
+  exit 2
+}
 
-# Fail fast on malformed match constants. The same values end up verbatim in
-# the udev rule installed by install.sh, where *, ? and [...] act as match
-# globs (a wildcard would turn the exact-match ACL into a pattern) and quotes
-# or control characters would corrupt the rule syntax parsed by root-udevd;
-# |, & and \ would additionally break the sed rendering of the rule template.
-for hex_value in "$KEYBOARD_VENDOR" "$KEYBOARD_PRODUCT" "$KEYBOARD_BUSTYPE"; do
-  if [[ ! "${hex_value,,}" =~ ^[0-9a-f]{4}$ ]]; then
-    log "keyboard match IDs must be 4 hex digits, got: $hex_value"
-    exit 1
+# Key maps: snake_case in input.lua, kebab-case in hyprctl.
+lua_key_for() { # $1=dwt|tap
+  case "$1" in
+    dwt) printf 'disable_while_typing' ;;
+    tap) printf 'tap_to_click' ;;
+    *) usage ;;
+  esac
+}
+
+hypr_opt_for() { # $1=dwt|tap
+  case "$1" in
+    dwt) printf 'input:touchpad:disable_while_typing' ;;
+    tap) printf 'input:touchpad:tap-to-click' ;;
+    *) usage ;;
+  esac
+}
+
+# --- embedded structural Lua editor -----------------------------------------
+# Extracted to a temp file per run; decides WHAT to write (structure) while
+# bash decides HOW to apply it (lock, atomic rename, reload, verify, rollback).
+write_editor() {
+  cat > "$1" <<'OTG_EDITOR_EOF'
+-- omarchy-trackpad-guard structural editor for Hyprland's input.lua.
+-- Embedded in bin/omarchy-trackpad-guard as a heredoc; this copy exists only
+-- for development/debugging. Edit the helper, not this file.
+--
+-- usage:
+--   lua otg-editor-dev.lua get  FILE KEY
+--   lua otg-editor-dev.lua set  FILE KEY true|false
+--
+-- get prints true|false|absent|ambiguous|error on stdout (detail on stderr),
+-- always exit 0. set prints the full new content on stdout, exit 0; on any
+-- non-canonical situation (duplicate key, key outside hl.config->input->
+-- touchpad, unrecognized syntax, non-literal value) it fails closed: exit 5,
+-- diagnostic on stderr, no output. Byte-range editing preserves formatting.
+
+local mode, file, key, newval = arg[1], arg[2], arg[3], arg[4]
+
+local function die5(msg)
+  io.stderr:write("otg-editor: " .. msg .. "\n")
+  os.exit(5)
+end
+
+if not mode or not file or not key then
+  die5("usage: otg-editor get|set FILE KEY [true|false]")
+end
+if mode ~= "get" and mode ~= "set" then die5("unknown mode: " .. mode) end
+if mode == "set" and newval ~= "true" and newval ~= "false" then
+  die5("set requires a literal value: true|false")
+end
+
+local fh, ferr = io.open(file, "rb")
+if not fh then
+  if mode == "get" then
+    io.stderr:write("otg-editor: cannot read " .. file .. ": " .. tostring(ferr) .. "\n")
+    print("error")
+    os.exit(0)
+  end
+  die5("cannot read " .. file .. ": " .. tostring(ferr))
+end
+local src = fh:read("a")
+fh:close()
+
+-----------------------------------------------------------------------------
+-- Tokenizer
+-----------------------------------------------------------------------------
+
+local KEYWORDS = {
+  ["local"] = true, ["function"] = true, ["end"] = true, ["if"] = true,
+  ["then"] = true, ["else"] = true, ["elseif"] = true, ["while"] = true,
+  ["do"] = true, ["for"] = true, ["in"] = true, ["repeat"] = true,
+  ["until"] = true, ["return"] = true, ["break"] = true, ["goto"] = true,
+  ["and"] = true, ["or"] = true, ["not"] = true,
+}
+
+-- At pos, if s[pos..] opens a long bracket ([[ / [==[ ...), return its level.
+local function long_bracket_level(s, pos)
+  if s:sub(pos, pos) ~= "[" then return nil end
+  local j = pos + 1
+  while s:sub(j, j) == "=" do j = j + 1 end
+  if s:sub(j, j) == "[" then return j - pos - 1 end
+  return nil
+end
+
+local function tokenize(s)
+  local toks = {}
+  local i, n = 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c:match("%s") then
+      i = i + 1
+    elseif c == "-" and s:sub(i + 1, i + 1) == "-" then
+      -- comment: -- line, or --[[ / --[==[ block
+      local lvl = long_bracket_level(s, i + 2)
+      if lvl then
+        local close = "]" .. ("="):rep(lvl) .. "]"
+        local _, ce = s:find(close, i, true)
+        if not ce then return nil, "unterminated block comment" end
+        i = ce + 1
+      else
+        local nl = s:find("\n", i, true)
+        i = nl and (nl + 1) or (n + 1)
+      end
+    elseif c == '"' or c == "'" then
+      local j = i + 1
+      local closed = false
+      while j <= n do
+        local d = s:sub(j, j)
+        if d == "\\" then
+          j = j + 2
+        elseif d == c then
+          closed = true
+          break
+        elseif d == "\n" then
+          return nil, "unterminated string"
+        else
+          j = j + 1
+        end
+      end
+      if not closed then return nil, "unterminated string" end
+      toks[#toks + 1] = { t = "str", s = i, e = j + 1 }
+      i = j + 1
+    elseif c == "[" and long_bracket_level(s, i) then
+      local lvl = long_bracket_level(s, i)
+      local close = "]" .. ("="):rep(lvl) .. "]"
+      local _, ce = s:find(close, i, true)
+      if not ce then return nil, "unterminated long string" end
+      toks[#toks + 1] = { t = "str", s = i, e = ce + 1 }
+      i = ce + 1
+    elseif c:match("[%a_]") then
+      local j = i
+      while j <= n and s:sub(j, j):match("[%w_]") do j = j + 1 end
+      local w = s:sub(i, j - 1)
+      local ty
+      if w == "true" or w == "false" or w == "nil" then
+        ty = "lit"
+      elseif KEYWORDS[w] then
+        ty = "kw"
+      else
+        ty = "name"
+      end
+      toks[#toks + 1] = { t = ty, v = w, s = i, e = j }
+      i = j
+    elseif c:match("%d") or (c == "." and s:sub(i + 1, i + 1):match("%d")) then
+      local j = i
+      if s:sub(i, i + 1):lower() == "0x" then
+        j = i + 2
+        while j <= n and s:sub(j, j):match("[%x]") do j = j + 1 end
+      else
+        while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
+        -- one fractional dot only; never eat a '..' concat
+        if s:sub(j, j) == "." and s:sub(j + 1, j + 1) ~= "." then
+          j = j + 1
+          while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
+        end
+        local e = s:sub(j, j)
+        if e == "e" or e == "E" then
+          local k = j + 1
+          if s:sub(k, k) == "+" or s:sub(k, k) == "-" then k = k + 1 end
+          if s:sub(k, k):match("%d") then
+            j = k
+            while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
+          end
+        end
+      end
+      toks[#toks + 1] = { t = "num", s = i, e = j }
+      i = j
+    else
+      local three = s:sub(i, i + 2)
+      local two = s:sub(i, i + 1)
+      if three == "..." then
+        toks[#toks + 1] = { t = "sym", v = "...", s = i, e = i + 3 }
+        i = i + 3
+      elseif two == ".." or two == "==" or two == "~=" or two == "<="
+          or two == ">=" or two == "::" or two == "//" or two == "<<"
+          or two == ">>" then
+        toks[#toks + 1] = { t = "sym", v = two, s = i, e = i + 2 }
+        i = i + 2
+      elseif c:match("[%p]") then
+        toks[#toks + 1] = { t = "sym", v = c, s = i, e = i + 1 }
+        i = i + 1
+      else
+        return nil, string.format("unexpected character %q", c)
+      end
+    end
+  end
+  return toks
+end
+
+local toks, terr = tokenize(src)
+if not toks then
+  if mode == "get" then
+    io.stderr:write("otg-editor: " .. file .. ": " .. terr .. "\n")
+    print("error")
+    os.exit(0)
+  end
+  die5("cannot tokenize " .. file .. ": " .. terr)
+end
+
+-----------------------------------------------------------------------------
+-- Parser (canonical Hyprland Lua-config grammar; fail closed otherwise)
+-----------------------------------------------------------------------------
+
+local pos = 1
+local occurrences = {}  -- of the target key: {path=array, value=?, vs=?, ve=?}
+local blocks = {}       -- table constructors: {path=array, brace_s, brace_e, close_s}
+local entry_names = {}  -- name -> list of paths (any active `name =` entry)
+
+local function at_eof() return pos > #toks end
+local function at(t, v)
+  local tk = toks[pos]
+  return tk ~= nil and tk.t == t and (v == nil or tk.v == v)
+end
+local function advance()
+  local tk = toks[pos]
+  pos = pos + 1
+  return tk
+end
+local function perr(msg) error({ otg = msg }, 0) end
+local function describe(tk)
+  if not tk then return "<eof>" end
+  return tk.v or tk.t
+end
+local function expect(t, v)
+  if not at(t, v) then
+    perr("expected " .. (v or t) .. ", got " .. describe(toks[pos]))
+  end
+  return advance()
+end
+
+-- Static content of a string token, or false when it cannot be resolved
+-- statically (escapes in short strings are deliberately not decoded).
+local function string_content(tok)
+  local c = src:sub(tok.s, tok.s)
+  if c == '"' or c == "'" then
+    local inner = src:sub(tok.s + 1, tok.e - 2)
+    if inner:find("\\", 1, true) then return false end
+    return inner
+  end
+  -- long string: [=*[ content ]=*]
+  local lvl = 0
+  local j = tok.s + 1
+  while src:sub(j, j) == "=" do lvl = lvl + 1; j = j + 1 end
+  local content = src:sub(tok.s + lvl + 2, tok.e - lvl - 3)
+  if content:sub(1, 1) == "\n" then content = content:sub(2) end
+  return content
+end
+
+local parse_exp, parse_primary, parse_args, parse_table, parse_block,
+      parse_stat, parse_func_rest, parse_suffix_loop
+
+local function shallow_copy(arr)
+  local out = {}
+  for i = 1, #arr do out[i] = arr[i] end
+  return out
+end
+
+parse_table = function(path)
+  local open = expect("sym", "{")
+  local blk = { path = path, brace_s = open.s, brace_e = open.e, close_s = nil }
+  blocks[#blocks + 1] = blk
+  while not at("sym", "}") do
+    if at_eof() then perr("unterminated table constructor") end
+    if at("name") and toks[pos + 1] and toks[pos + 1].t == "sym"
+        and toks[pos + 1].v == "=" then
+      local nm = advance().v
+      advance() -- '='
+      local child = shallow_copy(path)
+      child[#child + 1] = nm
+      entry_names[nm] = entry_names[nm] or {}
+      table.insert(entry_names[nm], child)
+      if nm == key then
+        local vt = toks[pos]
+        local occ = { path = child }
+        if vt and vt.t == "lit" and (vt.v == "true" or vt.v == "false") then
+          occ.value, occ.vs, occ.ve = vt.v, vt.s, vt.e
+        end
+        occurrences[#occurrences + 1] = occ
+      end
+      if at("sym", "{") then parse_table(child) else parse_exp() end
+    elseif at("sym", "[") then
+      advance()
+      -- A string-literal bracket key (["input"] = ...) is semantically a
+      -- named entry: record it with the same path rules, or set would
+      -- duplicate an active key it could not see. A dynamic key ([expr])
+      -- cannot be resolved statically: only dangerous on the hl.config
+      -- route, where it might BE the target key -- fail closed there.
+      local kname
+      if at("str") and toks[pos + 1] and toks[pos + 1].t == "sym"
+          and toks[pos + 1].v == "]" then
+        kname = string_content(advance())
+      else
+        parse_exp()
+        kname = false
+      end
+      expect("sym", "]")
+      expect("sym", "=")
+      if kname == false then
+        if path[1] == "hl.config" then
+          perr("dynamic table key inside hl.config(); cannot prove '" .. key .. "' absent")
+        end
+        if at("sym", "{") then parse_table({ "?" }) else parse_exp() end
+      else
+        local child = shallow_copy(path)
+        child[#child + 1] = kname
+        entry_names[kname] = entry_names[kname] or {}
+        table.insert(entry_names[kname], child)
+        if kname == key then
+          local vt = toks[pos]
+          local occ = { path = child }
+          if vt and vt.t == "lit" and (vt.v == "true" or vt.v == "false") then
+            occ.value, occ.vs, occ.ve = vt.v, vt.s, vt.e
+          end
+          occurrences[#occurrences + 1] = occ
+        end
+        if at("sym", "{") then parse_table(child) else parse_exp() end
+      end
+    elseif at("sym", "{") then
+      local child = shallow_copy(path)
+      child[#child + 1] = "#"
+      parse_table(child)
+    else
+      parse_exp()
+    end
+    if at("sym", ",") or at("sym", ";") then
+      advance()
+    elseif not at("sym", "}") then
+      perr("expected ',' or '}' in table constructor, got " .. describe(toks[pos]))
+    end
+  end
+  local close = expect("sym", "}")
+  blk.close_s = close.s
+end
+
+local function at_binop()
+  local tk = toks[pos]
+  if not tk then return false end
+  if tk.t == "sym" then
+    local v = tk.v
+    return v == ".." or v == "+" or v == "-" or v == "*" or v == "/"
+        or v == "%" or v == "^" or v == "==" or v == "~=" or v == "<"
+        or v == ">" or v == "<=" or v == ">=" or v == "//" or v == "<<"
+        or v == ">>" or v == "&" or v == "|" or v == "~"
+  end
+  if tk.t == "kw" then return tk.v == "and" or tk.v == "or" end
+  return false
+end
+
+local function at_unop()
+  return at("kw", "not") or at("sym", "-") or at("sym", "#") or at("sym", "~")
+end
+
+parse_exp = function()
+  while at_unop() do advance() end
+  parse_primary()
+  while at_binop() do
+    advance()
+    while at_unop() do advance() end
+    parse_primary()
+  end
+end
+
+parse_args = function(dotted)
+  if at("str") then
+    advance()
+    return
+  end
+  if at("sym", "{") then
+    parse_table({ dotted })
+    return
+  end
+  if at("sym", "(") then
+    advance()
+    if not at("sym", ")") then
+      while true do
+        if at("sym", "{") then parse_table({ dotted }) else parse_exp() end
+        if at("sym", ",") then advance() else break end
+      end
+    end
+    expect("sym", ")")
+    return
+  end
+  perr("malformed call arguments after " .. dotted)
+end
+
+parse_suffix_loop = function(dotted)
+  while true do
+    if at("sym", ".") then
+      advance()
+      dotted = dotted .. "." .. expect("name").v
+    elseif at("sym", "[") then
+      advance()
+      parse_exp()
+      expect("sym", "]")
+      dotted = dotted .. "[?]"
+    elseif at("sym", ":") then
+      advance()
+      dotted = dotted .. ":" .. expect("name").v
+      parse_args(dotted)
+    elseif at("sym", "(") or at("sym", "{") or at("str") then
+      parse_args(dotted)
+    else
+      break
+    end
+  end
+  return dotted
+end
+
+parse_primary = function()
+  if at("lit") or at("num") or at("str") or at("sym", "...") then
+    advance()
+  elseif at("kw", "function") then
+    advance()
+    parse_func_rest()
+  elseif at("sym", "{") then
+    parse_table({ "?" })
+  elseif at("sym", "(") then
+    advance()
+    parse_exp()
+    expect("sym", ")")
+    parse_suffix_loop("(?")
+  elseif at("name") then
+    parse_suffix_loop(expect("name").v)
+  else
+    perr("unexpected token in expression: " .. describe(toks[pos]))
+  end
+end
+
+parse_func_rest = function() -- '(' params ')' block 'end'
+  expect("sym", "(")
+  if not at("sym", ")") then
+    while true do
+      if at("name") or at("sym", "...") then
+        advance()
+      else
+        perr("bad function parameter: " .. describe(toks[pos]))
+      end
+      if at("sym", ",") then advance() else break end
+    end
+  end
+  expect("sym", ")")
+  parse_block({ ["end"] = true })
+  expect("kw", "end")
+end
+
+local function parse_explist()
+  while true do
+    if at("sym", "{") then parse_table({ "?" }) else parse_exp() end
+    if at("sym", ",") then advance() else break end
+  end
+end
+
+parse_stat = function(terms)
+  if at("sym", ";") then advance() return end
+  if at("kw", "local") then
+    advance()
+    if at("kw", "function") then
+      advance()
+      expect("name")
+      parse_func_rest()
+      return
+    end
+    while true do
+      expect("name")
+      if at("sym", "<") then -- 5.4 attributes: <close> / <const>
+        advance(); expect("name"); expect("sym", ">")
+      end
+      if at("sym", ",") then advance() else break end
+    end
+    if at("sym", "=") then
+      advance()
+      parse_explist()
+    end
+    return
+  end
+  if at("kw", "function") then
+    advance()
+    expect("name")
+    while at("sym", ".") or at("sym", ":") do
+      advance(); expect("name")
+    end
+    parse_func_rest()
+    return
+  end
+  if at("kw", "return") then
+    advance()
+    local tk = toks[pos]
+    local is_end = (not tk) or (tk.t == "kw" and terms[tk.v])
+        or (tk.t == "sym" and tk.v == ";")
+    if not is_end then parse_explist() end
+    if at("sym", ";") then advance() end
+    return
+  end
+  if at("kw", "if") then
+    advance(); parse_exp(); expect("kw", "then")
+    parse_block({ ["elseif"] = true, ["else"] = true, ["end"] = true })
+    while at("kw", "elseif") do
+      advance(); parse_exp(); expect("kw", "then")
+      parse_block({ ["elseif"] = true, ["else"] = true, ["end"] = true })
+    end
+    if at("kw", "else") then
+      advance()
+      parse_block({ ["end"] = true })
+    end
+    expect("kw", "end")
+    return
+  end
+  if at("kw", "while") then
+    advance(); parse_exp(); expect("kw", "do")
+    parse_block({ ["end"] = true }); expect("kw", "end")
+    return
+  end
+  if at("kw", "do") then
+    advance()
+    parse_block({ ["end"] = true })
+    expect("kw", "end")
+    return
+  end
+  if at("kw", "repeat") then
+    advance()
+    parse_block({ ["until"] = true })
+    expect("kw", "until")
+    parse_exp()
+    return
+  end
+  if at("kw", "for") then
+    advance(); expect("name")
+    while at("sym", ",") do advance(); expect("name") end
+    if at("sym", "=") then
+      advance(); parse_exp(); expect("sym", ","); parse_exp()
+      if at("sym", ",") then advance(); parse_exp() end
+    elseif at("kw", "in") then
+      advance()
+      parse_explist()
+    else
+      perr("malformed for statement")
+    end
+    expect("kw", "do")
+    parse_block({ ["end"] = true })
+    expect("kw", "end")
+    return
+  end
+  if at("kw", "break") then advance() return end
+  if at("kw", "goto") then advance(); expect("name"); return end
+  if at("sym", "::") then advance(); expect("name"); expect("sym", "::"); return end
+  if at("name") then
+    parse_suffix_loop(expect("name").v)
+    if at("sym", "=") or at("sym", ",") then
+      while at("sym", ",") do
+        advance()
+        parse_suffix_loop(expect("name").v)
+      end
+      expect("sym", "=")
+      parse_explist()
+    end
+    if at("sym", ";") then advance() end
+    return
+  end
+  if at("sym", "(") then
+    advance(); parse_exp(); expect("sym", ")")
+    parse_suffix_loop("(?")
+    if at("sym", "=") or at("sym", ",") then
+      while at("sym", ",") do
+        advance()
+        parse_suffix_loop(expect("name").v)
+      end
+      expect("sym", "=")
+      parse_explist()
+    end
+    if at("sym", ";") then advance() end
+    return
+  end
+  perr("unsupported statement starting with " .. describe(toks[pos]))
+end
+
+parse_block = function(terms)
+  while not at_eof() do
+    local tk = toks[pos]
+    if tk.t == "kw" and terms[tk.v] then return end
+    parse_stat(terms)
+  end
+end
+
+local pok, pobj = pcall(function() parse_block({}) end)
+if not pok then
+  local msg = (type(pobj) == "table" and pobj.otg) or tostring(pobj)
+  if mode == "get" then
+    io.stderr:write("otg-editor: " .. file .. ": " .. msg .. "\n")
+    print("error")
+    os.exit(0)
+  end
+  die5("cannot parse " .. file .. ": " .. msg)
+end
+
+-----------------------------------------------------------------------------
+-- Analysis
+-----------------------------------------------------------------------------
+
+local function is_canonical(p)
+  return #p == 4 and p[1] == "hl.config" and p[2] == "input"
+      and p[3] == "touchpad" and p[4] == key
+end
+
+local canonical, noncanonical = {}, {}
+for _, o in ipairs(occurrences) do
+  if is_canonical(o.path) then
+    canonical[#canonical + 1] = o
+  else
+    noncanonical[#noncanonical + 1] = o
+  end
+end
+
+if mode == "get" then
+  if #noncanonical > 0 then
+    io.stderr:write("otg-editor: '" .. key .. "' is set outside hl.config->input->touchpad\n")
+    print("error")
+  elseif #canonical > 1 then
+    print("ambiguous")
+  elseif #canonical == 0 then
+    print("absent")
+  elseif not canonical[1].value then
+    io.stderr:write("otg-editor: '" .. key .. "' has a non-literal value\n")
+    print("error")
+  else
+    print(canonical[1].value)
+  end
+  os.exit(0)
+end
+
+-- mode == "set" (fail closed)
+if #noncanonical > 0 then
+  die5("'" .. key .. "' is set outside hl.config->input->touchpad (unsupported location); edit " .. file .. " manually")
+end
+if #canonical > 1 then
+  die5("duplicate active '" .. key .. "' entries in " .. file .. "; fix manually")
+end
+
+-----------------------------------------------------------------------------
+-- Editing by byte ranges
+-----------------------------------------------------------------------------
+
+local function line_of(p)
+  local _, cnt = src:sub(1, p - 1):gsub("\n", "")
+  return cnt + 1
+end
+
+-- Offset of the first byte of the line containing p ('.' matches '\n' in Lua).
+local function line_start_offset(p)
+  local last_nl = src:sub(1, p - 1):match("^.*()\n")
+  return (last_nl or 0) + 1
+end
+
+local function line_text(p)
+  local ls = line_start_offset(p)
+  local le = (src:find("\n", ls, true) or (#src + 1)) - 1
+  return src:sub(ls, le)
+end
+
+local function first_token_after(offset)
+  for _, tk in ipairs(toks) do
+    if tk.s >= offset then return tk end
+  end
+  return nil
+end
+
+-- Indent for a new entry in blk: the indent of the first entry's line, or the
+-- opening line's indent + 4 spaces when the block is empty.
+local function detect_indent(blk, nxt)
+  if nxt and nxt.s ~= blk.close_s then
+    return line_text(nxt.s):match("^[ \t]*")
+  end
+  return line_text(blk.brace_s):match("^[ \t]*") .. "    "
+end
+
+-- Insert `text` as a new first entry of the table constructor blk.
+local function insert_into_block(blk, text)
+  local nxt = first_token_after(blk.brace_e)
+  local open_line = line_of(blk.brace_s)
+  if nxt and line_of(nxt.s) > open_line then
+    -- multiline block: new line right after the opening line
+    local nl = src:find("\n", blk.brace_e, true)
+    if not nl then
+      die5("internal: unterminated opening line in block")
+    end
+    local indent = detect_indent(blk, nxt)
+    return src:sub(1, nl) .. indent .. text .. "\n" .. src:sub(nl + 1)
+  end
+  -- inline block: insert right after '{'
+  local pad = ""
+  if src:sub(blk.brace_e, blk.brace_e):match("[^ \t]") then
+    -- content follows on the same line: the text itself carries the spacing
+    pad = ""
+  end
+  local tail = src:sub(blk.brace_e)
+  local gap = ""
+  if tail:match("^%s*}") then gap = " " end
+  return src:sub(1, blk.brace_e - 1) .. " " .. text .. gap .. pad .. tail
+end
+
+local out
+if #canonical == 1 then
+  local o = canonical[1]
+  if not o.value then
+    die5("'" .. key .. "' has a non-literal value in " .. file .. "; edit manually")
+  end
+  if o.value == newval then
+    out = src
+  else
+    out = src:sub(1, o.vs - 1) .. newval .. src:sub(o.ve)
+  end
+else
+  local tp_blks, in_blks = {}, {}
+  for _, b in ipairs(blocks) do
+    local p = b.path
+    if #p == 3 and p[1] == "hl.config" and p[2] == "input" and p[3] == "touchpad" then
+      tp_blks[#tp_blks + 1] = b
+    elseif #p == 2 and p[1] == "hl.config" and p[2] == "input" then
+      in_blks[#in_blks + 1] = b
+    end
+  end
+  -- Fail closed on structural ambiguity: with several canonical blocks the
+  -- effective value depends on hl.config merge order, so never pick one.
+  if #tp_blks > 1 then
+    die5("multiple hl.config->input->touchpad blocks and no active '" .. key .. "'; edit " .. file .. " manually")
+  end
+  if #tp_blks == 1 then
+    out = insert_into_block(tp_blks[1], key .. " = " .. newval .. ",")
+  elseif #in_blks > 1 then
+    die5("multiple hl.config->input blocks and no touchpad block; edit " .. file .. " manually")
+  elseif #in_blks == 1 then
+    out = insert_into_block(in_blks[1], "touchpad = { " .. key .. " = " .. newval .. " },")
+  elseif entry_names["input"] then
+    die5("an 'input' table exists outside hl.config() in " .. file .. "; edit manually")
+  else
+    out = src
+    if #out > 0 and out:sub(-1) ~= "\n" then out = out .. "\n" end
+    out = out .. "-- Added by omarchy-trackpad-guard\n"
+        .. "hl.config({ input = { touchpad = { " .. key .. " = " .. newval .. " } } })\n"
+  end
+end
+
+io.write(out)
+os.exit(0)
+OTG_EDITOR_EOF
+}
+
+EDITOR_TMP=""
+cleanup_helper() {
+  if [[ -n "$EDITOR_TMP" ]]; then
+    rm -f -- "$EDITOR_TMP"
   fi
-done
-forbidden_name_chars='[][:cntrl:]"\\|&*?[]'
-if [[ -z "$KEYBOARD_NAME" || "$KEYBOARD_NAME" =~ $forbidden_name_chars ]]; then
-  log "keyboard match name is empty or contains forbidden characters"
-  exit 1
-fi
+  return 0
+}
+trap cleanup_helper EXIT
 
-for command_name in evtest flock hyprctl omarchy-hw-touchpad stdbuf; do
-  if ! command -v "$command_name" >/dev/null 2>&1; then
-    log "required command is missing: $command_name"
-    exit 1
+LUA_BIN=""
+resolve_lua() {
+  [[ -z "$LUA_BIN" ]] || return 0
+  LUA_BIN="$(command -v lua || command -v lua5.4 || true)"
+}
+
+ensure_editor() {
+  resolve_lua
+  [[ -n "$LUA_BIN" ]] || die 4 "cannot edit input.lua: lua is not installed"
+  if [[ -z "$EDITOR_TMP" ]]; then
+    EDITOR_TMP="$(mktemp)"
+    write_editor "$EDITOR_TMP"
   fi
-done
+}
 
-exec {lock_fd}>"$lock_file"
-if ! flock -n "$lock_fd"; then
-  log "another instance is already running"
-  exit 0
-fi
-printf '%s\n' "$$" > "$pid_file"
+# Prints true|false|absent|ambiguous|error; never fails on file content and
+# never dies (get exits != 0 only when Hyprland is down).
+editor_get() { # $1=file $2=lua-key
+  resolve_lua
+  if [[ -z "$LUA_BIN" ]]; then
+    printf 'error'
+    return
+  fi
+  ensure_editor
+  "$LUA_BIN" "$EDITOR_TMP" get "$1" "$2" 2>/dev/null || printf 'error'
+}
 
-discover_keyboard() {
+# Prints the new full content on stdout; exits non-zero (5) on non-canonical
+# grammar with the editor's diagnostic on stderr.
+editor_set() { # $1=file $2=lua-key $3=true|false
+  ensure_editor
+  "$LUA_BIN" "$EDITOR_TMP" set "$1" "$2" "$3"
+}
+
+# --- hyprctl plumbing --------------------------------------------------------
+
+# Prints "<bool> <set>" for an option; non-zero exit if Hyprland is down.
+hyprctl_get_bool() { # $1=hypr-option
+  local out bool setf
+  out="$(hyprctl -j getoption "$1" 2>/dev/null)" || return 1
+  bool="$(printf '%s' "$out" | sed -n 's/.*"bool": *\([a-zA-Z]*\).*/\1/p')"
+  setf="$(printf '%s' "$out" | sed -n 's/.*"set": *\([a-zA-Z]*\).*/\1/p')"
+  [[ "$bool" == "true" || "$bool" == "false" ]] || return 1
+  printf '%s %s\n' "$bool" "${setf:-false}"
+}
+
+hyprctl_configerrors() {
+  hyprctl configerrors 2>/dev/null || true
+}
+
+# Poll getoption up to ~2s for the wanted value, then diff configerrors
+# against the pre-reload baseline: only NEW errors that mention input.lua
+# fail; new foreign errors are a warning; pre-existing ones never block.
+verify_apply() { # $1=hypr-option $2=true|false $3=baseline-configerrors → 0|7
+  local opt=$1 want=$2 before=$3 read_back after new_lines
+  local _tries
+  read_back=""
+  for _tries in {1..20}; do
+    read_back="$(hyprctl_get_bool "$opt" 2>/dev/null)" && [[ "${read_back% *}" == "$want" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$read_back" && "${read_back% *}" == "$want" ]] || return 7
+  after="$(hyprctl_configerrors)"
+  new_lines="$(comm -13 \
+    <(printf '%s\n' "$before" | sed '/^[[:space:]]*$/d' | sort -u) \
+    <(printf '%s\n' "$after"  | sed '/^[[:space:]]*$/d' | sort -u))"
+  if [[ -n "$new_lines" ]]; then
+    if printf '%s' "$new_lines" | grep -qF 'input.lua'; then
+      return 7
+    fi
+    printf 'warning: new Hyprland config errors outside input.lua (not caused by this toggle):\n%s\n' "$new_lines" >&2
+  fi
+  return 0
+}
+
+derive_state() { # $1=file-status $2=effective → sync|pending|absent|ambiguous|error
+  case "$1" in
+    error) printf 'error' ;;
+    ambiguous) printf 'ambiguous' ;;
+    absent) printf 'absent' ;;
+    true|false)
+      if [[ "$1" == "$2" ]]; then printf 'sync'; else printf 'pending'; fi
+      ;;
+    *) printf 'error' ;;
+  esac
+}
+
+# --- get ---------------------------------------------------------------------
+
+cmd_get() { # $1=--json?
+  local json=${1:-}
+  [[ -z "$json" || "$json" == "--json" ]] || usage
+
+  resolve_lua
+  [[ -n "$LUA_BIN" ]] && ensure_editor  # in this shell: EDITOR_TMP must survive past $() subshells
+  local k lua_key opt fstate eff eff_bool eff_set state
+  local -A file_v eff_v set_v state_v
+  for k in dwt tap; do
+    lua_key="$(lua_key_for "$k")"
+    opt="$(hypr_opt_for "$k")"
+    fstate="$(editor_get "$CONFIG_FILE" "$lua_key")"
+    eff="$(hyprctl_get_bool "$opt")" \
+      || die 3 "Hyprland is not responding (is Hyprland running and hyprctl reachable?)"
+    eff_bool="${eff% *}"
+    eff_set="${eff#* }"
+    state="$(derive_state "$fstate" "$eff_bool")"
+    file_v[$k]=$fstate; eff_v[$k]=$eff_bool; set_v[$k]=$eff_set; state_v[$k]=$state
+  done
+
+  if [[ "$json" == "--json" ]]; then
+    local sep=""
+    printf '{'
+    for k in dwt tap; do
+      printf '%s' "$sep"
+      sep=","
+      local fv
+      case "${file_v[$k]}" in
+        true|false) fv="${file_v[$k]}" ;;
+        *) fv="\"${file_v[$k]}\"" ;;
+      esac
+      printf '"%s":{"file":%s,"effective":%s,"set":%s,"state":"%s"}' \
+        "$k" "$fv" "${eff_v[$k]}" "${set_v[$k]}" "${state_v[$k]}"
+    done
+    printf '}\n'
+  else
+    for k in dwt tap; do
+      printf '%s.file=%s %s.effective=%s %s.set=%s %s.state=%s\n' \
+        "$k" "${file_v[$k]}" "$k" "${eff_v[$k]}" "$k" "${set_v[$k]}" "$k" "${state_v[$k]}"
+    done
+  fi
+}
+
+# --- set ---------------------------------------------------------------------
+
+rotate_backups() { # $1=file — keep the newest 5 .bak.trackpad-guard.<ns>.<pid>
+  local file=$1 b ep
+  ls -1d "$file".bak.trackpad-guard.* 2>/dev/null | while IFS= read -r b; do
+    ep="${b##*.bak.trackpad-guard.}"   # "<ns>.<pid>"
+    ep="${ep%%.*}"                    # "<ns>" (fixed 19-digit width → lexical == numeric)
+    [[ "$ep" =~ ^[0-9]+$ ]] && printf '%s %s\n' "$ep" "$b"
+  done | sort -r | tail -n +6 | cut -d' ' -f2- | while IFS= read -r victim; do
+    rm -f -- "$victim"
+  done || true
+}
+
+cmd_set() { # $1=dwt|tap $2=on|off
+  local key=${1:-} onoff=${2:-}
+  local lua_key hypr_opt want
+  lua_key="$(lua_key_for "$key")"   # usage-exits on bad key
+  hypr_opt="$(hypr_opt_for "$key")"
+  case "$onoff" in
+    on) want=true ;;
+    off) want=false ;;
+    *) usage ;;
+  esac
+
+  command -v lua >/dev/null 2>&1 || command -v lua5.4 >/dev/null 2>&1 \
+    || die 4 "cannot edit input.lua: lua is not installed"
+  command -v luac >/dev/null 2>&1 || die 4 "cannot edit input.lua: luac is not installed"
+
+  # Serialize panel double-clicks and concurrent CLI runs.
+  exec {lock_fd}>"$LOCK_FILE"
+  if ! flock -w 5 "$lock_fd"; then
+    die 6 "another $prog operation is still in flight (lock timeout): $LOCK_FILE"
+  fi
+
+  local cur file file_status err_tmp
+  cur="$(hyprctl_get_bool "$hypr_opt")" \
+    || die 3 "Hyprland is not responding; not touching input.lua"
+  cur="${cur% *}"
+
+  # Resolve symlinks: dotfiles are often linked; edit the real file so the
+  # link stays a link (fixture: symlinked input.lua).
+  file="$(readlink -f "$CONFIG_FILE")"
+  [[ -f "$file" ]] || die 4 "input.lua not found: $CONFIG_FILE — the native-DWT design requires Hyprland's Lua config (Omarchy generates it)"
+  [[ -r "$file" && -w "$file" ]] || die 4 "input.lua is not readable/writable: $file"
+  if ! luac -p "$file" 2>/dev/null; then
+    die 4 "input.lua has pre-existing syntax errors; fix it manually first: luac -p $file"
+  fi
+
+  err_tmp="$(mktemp)"
+  ensure_editor
+  file_status="$("$LUA_BIN" "$EDITOR_TMP" get "$file" "$lua_key" 2>"$err_tmp")"
+  case "$file_status" in
+    ambiguous)
+      rm -f "$err_tmp"
+      die 5 "duplicate active '$lua_key' entries in $file; fix it manually"
+      ;;
+    error)
+      local detail
+      detail="$(<"$err_tmp")"
+      rm -f "$err_tmp"
+      die 5 "'$lua_key' is not in the canonical hl.config->input->touchpad location or the file uses unsupported grammar; edit it manually. ${detail:-}"
+      ;;
+  esac
+  rm -f "$err_tmp"
+
+  # No-op fast path: runtime and file already agree with the request.
+  if [[ "$cur" == "$want" && "$file_status" == "$want" ]]; then
+    printf '%s=%s\n' "$lua_key" "$want"
+    exit 0
+  fi
+
+  local ce_before
+  ce_before="$(hyprctl_configerrors)"
+
+  # File already carries the wanted value (edited outside, never reloaded):
+  # no edit needed — apply and verify only.
+  if [[ "$file_status" == "$want" ]]; then
+    if hyprctl reload >/dev/null 2>&1 && verify_apply "$hypr_opt" "$want" "$ce_before"; then
+      printf '%s=%s\n' "$lua_key" "$want"
+      exit 0
+    fi
+    die 7 "input.lua already has $lua_key=$want but Hyprland did not apply it cleanly; inspect 'hyprctl configerrors'"
+  fi
+
+  local preimage inode_before backup tmp new_tmp attempt now_hash now_inode
+  local max_attempts=2
+  backup=""
+  for (( attempt = 1; attempt <= max_attempts; attempt++ )); do
+    preimage="$(sha256sum "$file" | cut -d' ' -f1)"
+    inode_before="$(stat -c '%i' "$file")"
+    # %s%N + PID: same-second serialized sets (and the retry below) must
+    # never overwrite each other's backup.
+    backup="$file.bak.trackpad-guard.$(date +%s%N).$$"
+    cp -a -- "$file" "$backup"
+
+    new_tmp="$(mktemp)"
+    if ! editor_set "$file" "$lua_key" "$want" > "$new_tmp" 2>/dev/null; then
+      rm -f -- "$new_tmp"
+      die 5 "cannot edit $file: unsupported grammar (see stderr); file left untouched"
+    fi
+
+    tmp="$(mktemp "${file}.otg.XXXXXX")"
+    cat "$new_tmp" > "$tmp"
+    rm -f -- "$new_tmp"
+
+    if ! luac -p "$tmp" 2>/dev/null; then
+      rm -f -- "$tmp"
+      die 4 "internal error: the edited result does not compile; file left untouched"
+    fi
+
+    # Concurrency: hash+inode (not mtime/size) must be unchanged since the
+    # read under the lock; a same-size external edit in the same second is
+    # otherwise invisible. Retry once, then leave the external version alone.
+    now_hash="$(sha256sum "$file" | cut -d' ' -f1)"
+    now_inode="$(stat -c '%i' "$file")"
+    if [[ "$now_hash" != "$preimage" || "$now_inode" != "$inode_before" ]]; then
+      rm -f -- "$tmp"
+      if (( attempt < max_attempts )); then
+        continue
+      fi
+      die 6 "input.lua was modified externally during the edit; kept the external version (backup: $backup)"
+    fi
+
+    chmod --reference="$file" "$tmp"
+    mv -f -- "$tmp" "$file"  # atomic rename
+    break
+  done
+
+  rotate_backups "$file"
+
+  if hyprctl reload >/dev/null 2>&1 && verify_apply "$hypr_opt" "$want" "$ce_before"; then
+    printf '%s=%s\n' "$lua_key" "$want"
+    exit 0
+  fi
+
+  # Rollback: restore the backup with the same atomic rename and reload back.
+  mv -f -- "$backup" "$file"
+  hyprctl reload >/dev/null 2>&1 || true
+  die 7 "reload did not apply $lua_key=$want (or introduced new input.lua errors); input.lua restored"
+}
+
+# --- doctor ------------------------------------------------------------------
+
+discover_xremap_node() { # → prints /dev/input/eventNN; non-zero if absent
   local event_path input_path name vendor product bustype
-
-  keyboard_event=""
-  for event_path in /sys/class/input/event*; do
+  for event_path in "$SYSFS_ROOT"/class/input/event*; do
     [[ -e "$event_path" ]] || continue
     input_path="$(readlink -f "$event_path/device")"
-    # The event source IS xremap's uinput node, so it must live under
-    # /sys/devices/virtual; a physical device spoofing these IDs is rejected.
     case "$input_path" in
-      /sys/devices/virtual/*) ;;
+      "$SYSFS_ROOT"/devices/virtual/*) ;;
       *) continue ;;
     esac
     [[ -r "$input_path/name" && -r "$input_path/id/vendor" && -r "$input_path/id/product" && -r "$input_path/id/bustype" ]] || continue
-
     name="$(<"$input_path/name")"
     vendor="$(<"$input_path/id/vendor")"
     product="$(<"$input_path/id/product")"
     bustype="$(<"$input_path/id/bustype")"
-
     if [[ "$name" == "$KEYBOARD_NAME" &&
           "${vendor,,}" == "${KEYBOARD_VENDOR,,}" &&
           "${product,,}" == "${KEYBOARD_PRODUCT,,}" &&
           "${bustype,,}" == "${KEYBOARD_BUSTYPE,,}" ]]; then
-      keyboard_event="/dev/input/${event_path##*/}"
-      break
-    fi
-  done
-
-  [[ -c "$keyboard_event" && -r "$keyboard_event" ]]
-}
-
-trackpad_name="$(omarchy-hw-touchpad)"
-if [[ -z "$trackpad_name" || "$trackpad_name" == *[[:cntrl:]]* ]]; then
-  log "could not identify a safe Hyprland touchpad name"
-  exit 1
-fi
-
-quoted_trackpad_name="${trackpad_name//\\/\\\\}"
-quoted_trackpad_name="${quoted_trackpad_name//\"/\\\"}"
-
-# The guard freezes the pointer by holding an exclusive evdev grab
-# (EVIOCGRAB via `evtest --grab`) on the touchpad node while text keys are
-# pressed — NOT by toggling hl.device(enabled=…). Each hl.device toggle
-# re-initializes the I2C HID device in Hyprland; doing that per typing burst
-# produced intermittent ghost contacts on the touchpad and stuck touch state
-# in Hyprland (+1 finger on every gesture until `hyprctl reload`), the
-# "dead trackpad" incident of 2026-09-04. An fd-bound grab costs nothing to
-# acquire/release and vanishes when the fd closes, so it cannot corrupt
-# device state.
-ensure_trackpad_enabled() {
-  # One-shot recovery from the pre-grab design: old versions toggled
-  # hl.device(enabled=false) and a SIGKILL could leave the touchpad dead in
-  # Hyprland. A single re-enable at startup/exit (no touch in flight) is
-  # safe — unlike the per-burst toggles that caused the incident above.
-  log "ensuring trackpad enabled=true in Hyprland (legacy-state recovery)"
-  if ! hyprctl eval "hl.device({ name = \"$quoted_trackpad_name\", enabled = true })" >/dev/null 2>&1; then
-    log "warning: failed to set trackpad enabled=true (hyprctl eval)"
-    return 1
-  fi
-}
-
-# Resolve the touchpad's /dev/input/eventNN node fresh before every grab:
-# event numbers change across re-enumeration. Hyprland device names are the
-# sysfs input name lowercased with spaces turned into dashes, which also
-# disambiguates the twin "ASUF1208:00 2808:0218 Mouse" interface (its
-# normalized name ends in -mouse, ours in -touchpad).
-touchpad_event_node() {
-  local event_path name normalized
-  for event_path in /sys/class/input/event*; do
-    [[ -e "$event_path" && -r "$event_path/device/name" ]] || continue
-    name="$(<"$event_path/device/name")"
-    normalized="${name,,}"
-    normalized="${normalized// /-}"
-    if [[ "$normalized" == "$trackpad_name" ]]; then
-      printf '%s\n' "/dev/input/${event_path##*/}"
+      printf '/dev/input/%s\n' "${event_path##*/}"
       return 0
     fi
   done
   return 1
 }
 
-grab_pid=""
-grab_watchdog_pid=""
-tp_events_fd=""
-pad_dirty=false
-defer_deadline=""
-
-grab_touchpad() {
-  local node
-  if ! node="$(touchpad_event_node)"; then
-    log "warning: touchpad event node not found; leaving pointer active"
-    return 0
-  fi
-  if [[ ! -r "$node" ]]; then
-    log "warning: $node is not readable (udev ACL missing?); leaving pointer active"
-    return 0
-  fi
-  # The grabber is a named coproc (not >/dev/null): its stream IS the pad
-  # state. The grab is exclusive, so every touch event is delivered here —
-  # letting the guard see contacts that begin while libinput is blind.
-  coproc TP_GRAB { exec stdbuf -oL -eL evtest --grab "$node" 2>/dev/null; }
-  grab_pid="$TP_GRAB_PID"
-  tp_events_fd="${TP_GRAB[0]}"
-  exec {TP_GRAB[1]}>&-  # we never write to the grabber
-  pad_dirty=false
-  defer_deadline=""
-  # Watchdog: the grab fd lives in the evtest child, not in the guard, so an
-  # orphaned child would freeze the touchpad indefinitely. If the guard dies
-  # without running cleanup (SIGKILL on a manual launch), the watchdog kills
-  # the grabber and the kernel releases the grab with the fd. $$ inside the
-  # subshell still expands to the guard's PID (bash keeps $$ in subshells).
-  # Under systemd this is a second net behind KillMode=control-group, which
-  # reaps the whole cgroup when the unit stops or restarts.
-  ( while kill -0 $$ 2>/dev/null; do sleep 0.3; done; kill "$grab_pid" 2>/dev/null ) &
-  grab_watchdog_pid=$!
-  log "grabbed $node (exclusive evdev grab while typing)"
+# Prints one line per ACTIVE quirks section: name, MatchName-ok, MatchV+P-ok,
+# AttrKeyboardIntegration=internal-ok (tab-separated). Commented lines never
+# count.
+quirk_sections() { # $1=quirks-file
+  awk -v want_name="$KEYBOARD_NAME" \
+      -v want_vendor="0x${KEYBOARD_VENDOR}" \
+      -v want_product="0x${KEYBOARD_PRODUCT}" '
+    function flush() {
+      if (have_section) printf "%s\t%d\t%d\t%d\n", name, mn, (mv && mp), attr
+    }
+    /^[ \t]*#/ { next }
+    /^[ \t]*\[/ {
+      flush()
+      have_section = 1; mn = 0; mv = 0; mp = 0; attr = 0
+      name = $0
+      sub(/^[ \t]*\[/, "", name); sub(/\][ \t]*$/, "", name)
+      next
+    }
+    have_section && /^[ \t]*[A-Za-z]/ {
+      k = $0; sub(/[ \t]*=.*/, "", k)
+      v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]*$/, "", v)
+      if (k == "MatchName" && v == want_name) mn = 1
+      if (k == "MatchVendor" && tolower(v) == tolower(want_vendor)) mv = 1
+      if (k == "MatchProduct" && tolower(v) == tolower(want_product)) mp = 1
+      if (k == "AttrKeyboardIntegration" && v == "internal") attr = 1
+    }
+    END { flush() }
+  ' "$1"
 }
 
-# Track pad state from the grabber's stream. BTN_TOUCH 1/0 bracket the
-# first/last contact. Contacts that began BEFORE the grab never emit a 1 to
-# us — and they are safe anyway: libinput saw and palm-classified their DOWN
-# before going blind. The dangerous case is a contact that begins DURING the
-# grab, and that one always arrives here as a value 1.
-drain_touchpad() {
-  local tp_line
-  [[ -n "$tp_events_fd" ]] || return 0
-  # `read -t 0` never assigns — it only probes availability; the plain read
-  # right after consumes the line. Single reader, so no race between them.
-  while IFS= read -r -t 0 _probe <&"$tp_events_fd"; do
-    IFS= read -r tp_line <&"$tp_events_fd" || break
-    case "$tp_line" in
-      *"code 330 (BTN_TOUCH), value 1") pad_dirty=true ;;
-      *"code 330 (BTN_TOUCH), value 0") pad_dirty=false ;;
-    esac
-  done
-  # Never propagate the last probe's nonzero status: callers run under
-  # set -e (and cleanup runs from the EXIT trap, where an abort would
-  # skip the grab release).
-  return 0
-}
-
-release_touchpad() {
-  [[ -n "$grab_pid" ]] || return 0
-  kill "$grab_pid" 2>/dev/null || true
-  wait "$grab_pid" 2>/dev/null || true
-  grab_pid=""
-  kill "$grab_watchdog_pid" 2>/dev/null || true
-  wait "$grab_watchdog_pid" 2>/dev/null || true
-  grab_watchdog_pid=""
-  if [[ -n "$tp_events_fd" ]]; then
-    exec {tp_events_fd}<&-
-    tp_events_fd=""
-  fi
-  log "released touchpad grab"
-}
-
-# Gate every release on pad state. Releasing while a contact that began
-# during the grab is still active would hand libinput an already-open
-# TRACKING_ID it never saw go down: it counts it as a new, unclassified
-# touch — a ghost finger, +1 on every gesture until the contact physically
-# ends (the 2026-09-05 "+1 finger" incident). Defer until the pad is clean,
-# with a 5s cap: a permanent freeze is worse than a transient ghost in that
-# rare case. Returns 1 when deferred — call sites must neutralize that
-# status (`|| true`): under set -e a bare deferred call would kill the
-# guard mid-grab.
-attempt_release() {
-  $grab_active || return 0
-  drain_touchpad
-  if $pad_dirty; then
-    if [[ -z "$defer_deadline" ]]; then
-      defer_deadline=$(( $(date +%s) + 5 ))
-      log "release deferred, pad dirty (contact began during grab)"
-      return 1
-    elif (( $(date +%s) < defer_deadline )); then
-      return 1
+# managed | external | conflict | absent
+quirk_status() { # $1=quirks-file
+  local file=$1
+  [[ -f "$file" ]] || { printf 'absent'; return; }
+  if grep -qF -- "$SENTINEL_START" "$file"; then printf 'managed'; return; fi
+  local external=0 conflict=0 name mn mvp attr
+  while IFS=$'\t' read -r name mn mvp attr; do
+    if [[ "$attr" == "1" && ( "$mn" == "1" || "$mvp" == "1" ) ]]; then
+      external=1
+    elif [[ "$name" == "$SECTION_NAME" ]]; then
+      conflict=1
+    elif [[ "$mn" == "1" || "$mvp" == "1" ]]; then
+      conflict=1
     fi
-    log "warning: pad still dirty after 5s cap; forcing release"
-  fi
-  release_touchpad
-  grab_active=false
-  pad_dirty=false
-  defer_deadline=""
-  return 0
+  done < <(quirk_sections "$file")
+  if (( external )); then printf 'external'
+  elif (( conflict )); then printf 'conflict'
+  else printf 'absent'; fi
 }
 
-# Defensive re-enable: versions before the grab design could leave the
-# trackpad disabled in Hyprland, so every start (including systemd restarts)
-# first recovers a known enabled state.
-ensure_trackpad_enabled 2>/dev/null || true
+cmd_doctor() {
+  local problems=0
+  local node qstatus
 
-cleanup() {
-  trap - EXIT INT TERM HUP
-  # The exit path is a release like any other and gets the same dirty-pad
-  # gating, bounded by the same 5s cap so shutdown can never get stuck.
-  if $grab_active; then
-    local deadline=$(( $(date +%s) + 5 ))
-    drain_touchpad
-    while $pad_dirty && (( $(date +%s) < deadline )); do
-      sleep 0.1
-      drain_touchpad
-    done
-    $pad_dirty && log "warning: pad still dirty at exit after 5s cap; forcing release"
+  resolve_lua
+  [[ -n "$LUA_BIN" ]] && ensure_editor
+  printf '%s doctor (v%s)\n' "$prog" "$VERSION"
+
+  if node="$(discover_xremap_node)"; then
+    printf 'ok: xremap virtual keyboard node: %s\n' "$node"
+  else
+    printf 'note: no xremap virtual keyboard node; without a remap stack the internal keyboard pairs natively (nothing to do)\n'
+    node=""
   fi
-  release_touchpad
-  ensure_trackpad_enabled 2>/dev/null || true
-  rm -f -- "$pid_file"
-}
 
-trap cleanup EXIT INT TERM HUP
-
-# xremap is a hard dependency: without its virtual keyboard there is no
-# observable keyboard node. The 30x1s discovery loop below tolerates xremap
-# starts/restarts (xremap.service runs with Restart=always), so here we only
-# warn.
-command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet xremap && log "warning: xremap.service is not active; its virtual keyboard may not exist yet"
-
-for _ in {1..30}; do
-  if discover_keyboard; then
-    break
-  fi
-  sleep 1
-done
-
-if [[ ! -c "$keyboard_event" || ! -r "$keyboard_event" ]]; then
-  log "could not open the xremap virtual keyboard event device"
-  log "is xremap.service active? See the xremap/kmonad section in README.md"
-  exit 1
-fi
-
-log "monitoring ${keyboard_event} (${KEYBOARD_NAME}); grabbing ${trackpad_name} while typing; idle release is ${TIMEOUT_SECONDS}s"
-
-declare -A held_modifiers=()
-
-is_modifier() {
-  case "$1" in
-    KEY_LEFTCTRL|KEY_RIGHTCTRL|KEY_LEFTALT|KEY_RIGHTALT|KEY_LEFTSHIFT|KEY_RIGHTSHIFT|KEY_LEFTMETA|KEY_RIGHTMETA)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+  qstatus="$(quirk_status "$QUIRKS_FILE")"
+  case "$qstatus" in
+    managed)
+      printf 'ok: managed quirk section present in %s\n' "$QUIRKS_FILE" ;;
+    external)
+      printf 'ok: external equivalent quirk present in %s (unmanaged; left untouched by install/uninstall)\n' "$QUIRKS_FILE" ;;
+    conflict)
+      printf 'problem: a conflicting section named [%s] (or one matching this keyboard without AttrKeyboardIntegration=internal) exists in %s; reconcile manually\n' "$SECTION_NAME" "$QUIRKS_FILE"
+      problems=1 ;;
+    absent)
+      if [[ -n "$node" ]]; then
+        printf 'problem: no quirk section pairing the xremap keyboard as internal; DWT will not act — run ./install.sh\n'
+        problems=1
+      else
+        printf 'note: no quirk section (no xremap stack to pair)\n'
+      fi ;;
   esac
-}
 
-is_navigation_key() {
-  case "$1" in
-    KEY_ESC|KEY_TAB|KEY_UP|KEY_DOWN|KEY_LEFT|KEY_RIGHT|KEY_HOME|KEY_END|KEY_PAGEUP|KEY_PAGEDOWN|KEY_INSERT|KEY_F[0-9]|KEY_F1[0-9]|KEY_F2[0-4])
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-coproc KEY_EVENTS { exec stdbuf -oL -eL evtest "$keyboard_event"; }
-events_fd="${KEY_EVENTS[0]}"
-evtest_pid="$KEY_EVENTS_PID"
-
-while true; do
-  line=""
-  if $grab_active; then
-    # While a release is deferred (dirty pad) poll at 0.1s so a palm lift is
-    # seen promptly; otherwise the keyboard read timeout IS the idle release.
-    read_timeout="$TIMEOUT_SECONDS"
-    [[ -n "$defer_deadline" ]] && read_timeout="0.1"
-    if ! IFS= read -r -t "$read_timeout" line <&"$events_fd"; then
-      if ! kill -0 "$evtest_pid" 2>/dev/null; then
-        break
+  # Relogin heuristic: quirks load when libinput's context is created at
+  # session start; a file newer than the Hyprland process is not live yet.
+  if [[ -f "$QUIRKS_FILE" ]] && [[ "$qstatus" == "managed" || "$qstatus" == "external" ]]; then
+    local hypr_pid hypr_start quirks_mtime
+    hypr_pid="$(pgrep -x Hyprland | head -n 1 || true)"
+    if [[ -n "$hypr_pid" && -r "/proc/$hypr_pid" ]]; then
+      hypr_start="$(stat -c '%Y' "/proc/$hypr_pid" 2>/dev/null || true)"
+      quirks_mtime="$(stat -c '%Y' "$QUIRKS_FILE" 2>/dev/null || true)"
+      if [[ -n "$hypr_start" && -n "$quirks_mtime" ]] && (( quirks_mtime > hypr_start )); then
+        printf 'note: %s is newer than the running Hyprland; quirks load at session start — log out and back in for DWT pairing\n' "$QUIRKS_FILE"
       fi
-      attempt_release || true
+    fi
+  fi
+
+  local k lua_key opt eff fstate state
+  for k in dwt tap; do
+    lua_key="$(lua_key_for "$k")"
+    opt="$(hypr_opt_for "$k")"
+    if ! eff="$(hyprctl_get_bool "$opt")"; then
+      printf 'problem: Hyprland is not responding (getoption %s failed)\n' "$opt"
+      problems=1
       continue
     fi
-  elif ! IFS= read -r line <&"$events_fd"; then
-    break
+    fstate="$(editor_get "$CONFIG_FILE" "$lua_key")"
+    state="$(derive_state "$fstate" "${eff% *}")"
+    printf 'state: %s effective=%s (set=%s) file=%s → %s\n' "$lua_key" "${eff% *}" "${eff#* }" "$fstate" "$state"
+    case "$state" in
+      pending)
+        printf 'note: %s differs between file and runtime; a reload (or the next toggle) will sync it\n' "$lua_key" ;;
+      ambiguous)
+        printf 'problem: %s is duplicated in %s; fix manually\n' "$lua_key" "$CONFIG_FILE"
+        problems=1 ;;
+      error)
+        printf 'problem: %s could not be read from %s (missing, unreadable or unsupported grammar)\n' "$lua_key" "$CONFIG_FILE"
+        problems=1 ;;
+    esac
+  done
+
+  local errs
+  errs="$(hyprctl_configerrors)"
+  if [[ -n "${errs//[[:space:]]/}" ]]; then
+    printf 'note: hyprctl configerrors is not empty (pre-existing errors never block toggles):\n%s\n' "$errs"
+  else
+    printf 'ok: hyprctl configerrors is empty\n'
   fi
 
-  [[ "$line" == *"type 1 (EV_KEY)"* ]] || continue
-
-  key_fragment="${line#*code }"
-  key_fragment="${key_fragment#*\(}"
-  key="${key_fragment%%\)*}"
-  value="${line##*value }"
-
-  [[ "$key" == KEY_* ]] || continue
-  [[ "$value" == "0" || "$value" == "1" || "$value" == "2" ]] || continue
-
-  if is_modifier "$key"; then
-    if [[ "$value" == "0" ]]; then
-      unset 'held_modifiers[$key]'
-    else
-      held_modifiers["$key"]=1
-      attempt_release || true
-    fi
-    continue
+  if (( problems )); then
+    printf 'doctor: problems found\n'
+    return 1
   fi
+  printf 'doctor: all good\n'
+  return 0
+}
 
-  [[ "$value" != "0" ]] || continue
+# --- entry point --------------------------------------------------------------
 
-  if (( ${#held_modifiers[@]} > 0 )) || is_navigation_key "$key"; then
-    attempt_release || true
-  elif ! $grab_active; then
-    grab_touchpad
-    grab_active=true
-  fi
-done
+main() {
+  local cmd=${1:-}
+  case "$cmd" in
+    get) shift; cmd_get "${1:-}" ;;
+    set)
+      shift
+      [[ $# -eq 2 ]] || usage
+      cmd_set "$1" "$2"
+      ;;
+    doctor) cmd_doctor ;;
+    -h|--help|help) usage ;;
+    *) usage ;;
+  esac
+}
 
-log "keyboard event stream ended"
-exit 1
+main "$@"

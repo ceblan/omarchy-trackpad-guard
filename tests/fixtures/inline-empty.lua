@@ -1,0 +1,1 @@
+hl.config({ input = { touchpad = {} } })

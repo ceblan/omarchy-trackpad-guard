@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Test stub for hyprctl. Serves getoption from a state file, logs every call,
+# and simulates post-reload state / configerrors changes.
+#
+# Env (all paths are per-test sandbox files):
+#   HYPRCTL_STUB_STATE              key=value lines: dwt=, tap=, dwt_set=, tap_set=
+#   HYPRCTL_STUB_LOG                call log (appended)
+#   HYPRCTL_STUB_POST               if set+exists: copied over STATE on `reload`
+#   HYPRCTL_STUB_ERRORS             current configerrors content
+#   HYPRCTL_STUB_ERRORS_ON_RELOAD   if set+exists: copied over ERRORS on `reload`
+#   HYPRCTL_STUB_DOWN=1             every command exits 1 (Hyprland unreachable)
+
+set -uo pipefail
+
+STATE="${HYPRCTL_STUB_STATE:?HYPRCTL_STUB_STATE is required}"
+LOG="${HYPRCTL_STUB_LOG:-/dev/null}"
+POST="${HYPRCTL_STUB_POST:-}"
+ERRORS="${HYPRCTL_STUB_ERRORS:-}"
+ERRORS_ON_RELOAD="${HYPRCTL_STUB_ERRORS_ON_RELOAD:-}"
+DOWN="${HYPRCTL_STUB_DOWN:-0}"
+
+printf 'hyprctl %s\n' "$*" >> "$LOG"
+
+if [[ "$DOWN" == "1" ]]; then
+  exit 1
+fi
+
+state_get() {
+  grep -E "^$1=" "$STATE" 2>/dev/null | tail -n 1 | cut -d= -f2-
+}
+
+cmd="${1:-}"
+if [[ "$cmd" == "-j" ]]; then
+  shift
+  cmd="${1:-}"
+fi
+
+case "$cmd" in
+  getoption)
+    opt="${2:-}"
+    case "$opt" in
+      input:touchpad:disable_while_typing) k=dwt ;;
+      input:touchpad:tap-to-click) k=tap ;;
+      *) echo "no such option"; exit 1 ;;
+    esac
+    bool="$(state_get "$k")"
+    setf="$(state_get "${k}_set")"
+    printf '{"option": "%s", "bool": %s, "set": %s }\n' "$opt" "${bool:-false}" "${setf:-true}"
+    ;;
+  reload)
+    if [[ -n "$POST" && -f "$POST" ]]; then
+      cp "$POST" "$STATE"
+    fi
+    if [[ -n "$ERRORS_ON_RELOAD" && -n "$ERRORS" && -f "$ERRORS_ON_RELOAD" ]]; then
+      cp "$ERRORS_ON_RELOAD" "$ERRORS"
+    fi
+    ;;
+  configerrors)
+    if [[ -n "$ERRORS" && -f "$ERRORS" ]]; then
+      cat "$ERRORS"
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+exit 0

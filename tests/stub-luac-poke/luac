@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# luac wrapper used ONLY by the external-concurrency fixture (19): when asked
+# to syntax-check the helper's temp file (*.otg.*), it first flips one
+# comment character in the real input.lua (a same-size edit), simulating an
+# external writer, then delegates to the real luac. Alternates the poke so
+# every call changes the file hash.
+#
+# Env:
+#   LUAC_POKE_FILE    the real input.lua to poke
+#   LUAC_POKE_COUNT   counter file (parity selects the poke direction)
+
+set -uo pipefail
+
+REAL_LUAC=/usr/bin/luac
+POKE_FILE="${LUAC_POKE_FILE:-}"
+COUNT_FILE="${LUAC_POKE_COUNT:-/dev/null}"
+
+if [[ "${1:-}" == "-p" && -n "$POKE_FILE" && "${2:-}" == *.otg.* ]]; then
+  n="$(cat "$COUNT_FILE" 2>/dev/null || echo 0)"
+  if (( n % 2 == 0 )); then
+    sed -i 's/Disable the touchpad/Disable_the_touchpad/' "$POKE_FILE"
+  else
+    sed -i 's/Disable_the_touchpad/Disable the touchpad/' "$POKE_FILE"
+  fi
+  echo $(( n + 1 )) > "$COUNT_FILE"
+fi
+
+exec "$REAL_LUAC" "$@"
