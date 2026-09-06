@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# test stub: log only (control --reload-rules / trigger --action=change / settle)
+printf 'udevadm %s\n' "$*" >> "${OTG_ORDER_LOG:-/dev/null}"
+exit 0

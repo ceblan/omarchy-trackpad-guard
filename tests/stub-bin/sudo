@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# test stub: log chronologically, then run the command as the calling user
+# (the sandbox only contains user-writable paths).
+printf 'sudo %s\n' "$*" >> "${OTG_ORDER_LOG:-/dev/null}"
+exec "$@"

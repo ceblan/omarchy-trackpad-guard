@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# test stub: log and succeed; is-active reports inactive.
+printf 'systemctl %s\n' "$*" >> "${OTG_ORDER_LOG:-/dev/null}"
+for a in "$@"; do
+  if [[ "$a" == "is-active" ]]; then
+    case " $* " in *" --quiet "*) ;; *) echo inactive ;; esac
+    exit 3
+  fi
+done
+exit 0

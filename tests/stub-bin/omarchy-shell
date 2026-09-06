@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+printf 'omarchy-shell %s\n' "$*" >> "${OTG_ORDER_LOG:-/dev/null}"
+exit 0

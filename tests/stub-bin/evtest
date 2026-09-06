@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub evtest for the orphan-reaper fixture. The inherited lock fd arrives on
+# stdin; keep it in fd 3 so the process stays a lock holder, and do NOT let
+# the sleep child inherit it (keeps /proc scanning unambiguous).
+exec 3<&0 0</dev/null
+sleep "${OTG_STUB_SLEEP:-300}" 3<&- &
+child=$!
+trap 'kill "$child" 2>/dev/null' EXIT
+wait "$child"

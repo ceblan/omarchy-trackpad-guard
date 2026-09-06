@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+printf 'fuser %s\n' "$*" >> "${OTG_ORDER_LOG:-/dev/null}"
+echo "stub fuser output for $*" >&2
+exit 0

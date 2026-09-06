@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# test stub: the fixture touchpad's Hyprland name
+printf '%s\n' "${OTG_STUB_TOUCHPAD_NAME:-asuf1208:00-2808:0218-touchpad}"
+exit 0

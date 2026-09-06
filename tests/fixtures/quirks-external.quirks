@@ -1,0 +1,9 @@
+# Treat this machine's xremap output as the laptop's internal keyboard.
+# This lets libinput pair it with the internal touchpad for DWT.
+[Xremap virtual keyboard]
+MatchUdevType=keyboard
+MatchBus=usb
+MatchVendor=0x1234
+MatchProduct=0x9950
+MatchName=xremap virtual keyboard
+AttrKeyboardIntegration=internal
