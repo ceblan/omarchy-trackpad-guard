@@ -4,9 +4,11 @@ import Quickshell.Io
 import qs.Ui
 import qs.Commons
 
-// Bar icon + control panel for omarchy-trackpad-guard. The icon shows the
-// daemon state; clicking it opens a popup with the daemon on/off switch, the
-// Hyprland tap-to-click switch and the typing-idle timeout slider (0.5-3 s).
+// Bar icon + control panel for omarchy-trackpad-guard 2.0 (native-DWT design).
+// No daemon: both switches call the one-shot helper, which edits
+// ~/.config/hypr/input.lua structurally, reloads Hyprland and verifies with
+// getoption. The switches track the EFFECTIVE Hyprland value; when the file
+// disagrees (edited outside, no reload yet) a caption shows the divergence.
 Panel {
   id: root
 
@@ -16,54 +18,98 @@ Panel {
   // nf-md-trackpad glyph (U+F07F8) as a surrogate pair, so the source
   // survives editors that mangle private-use codepoints.
   readonly property string trackpadGlyph: "\uDB81\uDFF8"
-  readonly property string unitName: "omarchy-trackpad-guard.service"
-  readonly property string overridePath: ".config/systemd/user/omarchy-trackpad-guard.service.d/override.conf"
+  readonly property string helperPath: Quickshell.env("HOME") + "/.local/bin/omarchy-trackpad-guard"
+  readonly property string inputLuaPath: Quickshell.env("HOME") + "/.config/hypr/input.lua"
 
-  property bool guardActive: false
+  property bool dwtEnabled: false
   property bool tapToClick: false
-  property real timeoutSeconds: 1.0
+  // File-side values: bool when the key is explicit, null when absent /
+  // ambiguous / unreadable (the helper reports a non-boolean state then).
+  property var dwtFile: null
+  property var tapFile: null
+  property string dwtState: ""
+  property string tapState: ""
   property bool stateLoaded: false
+  property string errorText: ""
+  property string noteText: ""
+  property bool setupIncomplete: false
+  property bool helperMissing: false
 
   // The bar sizes widgets from the root's implicit size; the anchored icon
   // button does not contribute one, so expose its dimensions explicitly.
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: root.refresh()
+  Component.onCompleted: {
+    root.refresh()
+    if (!doctorProc.running)
+      doctorProc.running = true
+  }
 
   onOpenedChanged: if (opened) root.refresh()
 
   function refresh() {
-    if (!stateProc.running)
+    if (!stateProc.running && !root.helperMissing)
       stateProc.running = true
+  }
+
+  // Existence probe: a plugin deployed without ./install.sh has no helper.
+  FileView {
+    path: root.helperPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.helperMissing = false
+    onLoadFailed: {
+      root.helperMissing = true
+      root.errorText = "helper no instalado; ejecuta ./install.sh"
+    }
+  }
+
+  // External edits re-sync the panel; the helper re-parses the file, so the
+  // file/runtime divergence shows up immediately. Used only as a trigger —
+  // the file text itself is never parsed here.
+  FileView {
+    path: root.inputLuaPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.refresh()
   }
 
   Process {
     id: stateProc
-    command: ["bash", "-c",
-      "state=$(systemctl --user is-active " + root.unitName + " 2>/dev/null); " +
-      "tap=$(hyprctl getoption input:touchpad:tap-to-click 2>/dev/null | grep -oP '^bool: \\K\\w+' | head -n1); " +
-      "to=$(grep -oP 'TRACKPAD_GUARD_TIMEOUT=\\K[0-9.]+' \"$HOME/" + root.overridePath + "\" 2>/dev/null | head -n1); " +
-      "printf 'guard=%s\\ntap=%s\\ntimeout=%s\\n' \"${state:-inactive}\" \"${tap:-false}\" \"${to:-1.0}\""]
+    command: [root.helperPath, "get", "--json"]
     stdout: StdioCollector {
+      id: stateStdout
       waitForEnd: true
-      onStreamFinished: {
-        var lines = text.split("\n")
-        for (var i = 0; i < lines.length; i++) {
-          var kv = lines[i].split("=")
-          if (kv.length !== 2)
-            continue
-          if (kv[0] === "guard")
-            root.guardActive = kv[1] === "active"
-          else if (kv[0] === "tap")
-            root.tapToClick = kv[1] === "true" || kv[1] === "1"
-          else if (kv[0] === "timeout") {
-            var v = parseFloat(kv[1])
-            if (!isNaN(v))
-              root.timeoutSeconds = Math.min(3.0, Math.max(0.5, v))
-          }
+    }
+    stderr: StdioCollector {
+      id: stateStderr
+      waitForEnd: true
+    }
+    // Parse in onExited (collector text is final here); onStreamFinished can
+    // race the exit signal on some processes.
+    onExited: function(exitCode) {
+      var ok = false
+      if (exitCode === 0) {
+        try {
+          var data = JSON.parse(String(stateStdout.text || ""))
+          root.dwtEnabled = data.dwt.effective === true
+          root.tapToClick = data.tap.effective === true
+          root.dwtFile = (typeof data.dwt.file === "boolean") ? data.dwt.file : null
+          root.tapFile = (typeof data.tap.file === "boolean") ? data.tap.file : null
+          root.dwtState = String(data.dwt.state || "error")
+          root.tapState = String(data.tap.state || "error")
+          root.stateLoaded = true
+          ok = true
+        } catch (e) {
+          console.warn("trackpad-guard", "bad get --json output:", e)
         }
-        root.stateLoaded = true
+      }
+      if (ok) {
+        root.errorText = ""
+      } else if (exitCode !== 0) {
+        var err = String(stateStderr.text || "").trim()
+        root.errorText = err !== "" ? err : "omarchy-trackpad-guard get failed (exit " + exitCode + ")"
       }
     }
   }
@@ -73,10 +119,30 @@ Panel {
   // before `hyprctl reload` finishes) and bounce the switches back.
   Process {
     id: applyProc
-    onExited: root.refresh()
+    stdout: StdioCollector {
+      id: applyStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: applyStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var err = String(applyStderr.text || "").trim()
+      if (exitCode !== 0) {
+        root.errorText = err !== "" ? err.slice(0, 300) : "toggle failed (exit " + exitCode + ")"
+      } else {
+        root.errorText = ""
+        // Convention with the helper: exit 0 with `warning:` lines on stderr
+        // is a non-blocking note (e.g. new foreign configerrors) — amber,
+        // never red.
+        root.noteText = err.indexOf("warning:") === 0 ? err.slice(0, 300) : ""
+      }
+      root.refresh()
+    }
   }
 
-  // argv must be fully built before calling this.
+  // argv must be fully built before calling this. Direct argv, no shell.
   function apply(argv) {
     if (applyProc.running)
       return
@@ -85,33 +151,32 @@ Panel {
   }
 
   function setGuard(on) {
-    guardActive = on
-    apply(["systemctl", "--user", on ? "start" : "stop", root.unitName])
+    dwtEnabled = on
+    apply([root.helperPath, "set", "dwt", on ? "on" : "off"])
   }
 
-  // tap-to-click lives in ~/.config/hypr/input.lua (Lua parser: hyprctl
-  // keyword is refused, and getoption only reflects config after a reload),
-  // so the toggle edits the value there and reloads Hyprland: runtime effect,
-  // persistence and getoption read-back in one step.
   function setTap(on) {
     tapToClick = on
-    var val = on ? "true" : "false"
-    apply(["bash", "-c",
-      "sed -i -E 's/^(\\s*tap_to_click\\s*=\\s*)(true|false)/\\1" + val + "/' \"$HOME/.config/hypr/input.lua\" && hyprctl reload >/dev/null 2>&1"])
+    apply([root.helperPath, "set", "tap", on ? "on" : "off"])
   }
 
-  // Commit the slider: write the systemd drop-in and reload the manager.
-  // Restart only when the unit is active, so a stopped guard stays stopped.
-  function applyTimeout(v) {
-    var val = v.toFixed(1)
-    if (val === timeoutSeconds.toFixed(1))
-      return
-    timeoutSeconds = parseFloat(val)
-    apply(["bash", "-c",
-      "d=\"$HOME/.config/systemd/user/omarchy-trackpad-guard.service.d\"; " +
-      "mkdir -p \"$d\" && printf '[Service]\\nEnvironment=TRACKPAD_GUARD_TIMEOUT=%s\\n' '" + val + "' > \"$d/override.conf\" && " +
-      "systemctl --user daemon-reload && " +
-      "if systemctl --user is-active --quiet " + root.unitName + "; then systemctl --user restart " + root.unitName + "; fi"])
+  // One-shot setup probe per shell start: doctor exit code != 0 means the
+  // setup is incomplete (e.g. no quirk pairing the xremap keyboard), which
+  // the panel reports as a non-blocking amber note.
+  Process {
+    id: doctorProc
+    command: [root.helperPath, "doctor"]
+    stdout: StdioCollector {
+      id: doctorStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: doctorStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.setupIncomplete = (exitCode !== 0)
+    }
   }
 
   BarIconButton {
@@ -119,9 +184,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.trackpadGlyph
-    dimmed: !root.guardActive
-    tooltipText: root.guardActive
-      ? "Trackpad Guard · " + root.timeoutSeconds.toFixed(1) + " s"
+    dimmed: !root.dwtEnabled
+    tooltipText: root.dwtEnabled
+      ? "Trackpad Guard · disable while typing on"
       : "Trackpad Guard · off"
     onPressed: function(b) { root.toggle() }
   }
@@ -147,10 +212,10 @@ Panel {
         anchors.right: parent.right
         spacing: Style.space(14)
 
-        // Hero: glyph, title + state line, daemon toggle on the right.
+        // Hero: glyph, title + state line, DWT toggle on the right.
         Item {
           width: parent.width
-          height: Math.max(heroGlyph.implicitHeight, heroText.implicitHeight, daemonToggle.trackHeight)
+          height: Math.max(heroGlyph.implicitHeight, heroText.implicitHeight, dwtToggle.trackHeight)
 
           Text {
             id: heroGlyph
@@ -160,7 +225,7 @@ Panel {
             font.family: Style.font.family
             font.pixelSize: Style.font.display
             color: Color.popups.text
-            opacity: root.guardActive ? 1.0 : 0.4
+            opacity: root.dwtEnabled ? 1.0 : 0.4
           }
 
           Column {
@@ -178,7 +243,7 @@ Panel {
               font.bold: true
             }
             Text {
-              text: (root.guardActive ? "DAEMON ON" : "DAEMON OFF") + " · " + timeoutSlider.liveValue.toFixed(1) + " S"
+              text: "DISABLE WHILE TYPING · " + (root.dwtEnabled ? "ON" : "OFF")
               color: Color.popups.text
               opacity: 0.6
               font.family: Style.font.family
@@ -187,18 +252,43 @@ Panel {
           }
 
           ToggleSwitch {
-            id: daemonToggle
+            id: dwtToggle
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            checked: root.guardActive
+            checked: root.dwtEnabled
             busy: applyProc.running
-            onToggled: root.setGuard(!root.guardActive)
+            // Gate until the first get lands (and the helper exists): the
+            // switch would otherwise show a lying default and issue a blind
+            // set.
+            interactive: root.stateLoaded && !root.helperMissing
+            onToggled: root.setGuard(!root.dwtEnabled)
 
             PanelToolTip {
-              visible: daemonToggle.containsMouse
-              text: "Start/stop the guard daemon"
+              visible: dwtToggle.containsMouse
+              text: "Native libinput disable-while-typing (palm guard) on the internal touchpad"
             }
           }
+        }
+
+        // Divergence / problem caption for the DWT row.
+        Text {
+          width: parent.width
+          visible: root.dwtState === "pending" || root.dwtState === "ambiguous"
+          text: root.dwtState === "ambiguous"
+            ? "CLAVE DUPLICADA EN input.lua — CORRIGE A MANO"
+            : "EN ARCHIVO: " + (root.dwtFile === true ? "ON" : "OFF") + " · PENDIENTE DE RELOAD"
+          color: root.dwtState === "ambiguous" ? Color.urgent : Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+
+          PanelToolTip {
+            visible: dwtCaptionMouse.containsMouse
+            text: root.dwtState === "ambiguous"
+              ? "The key is active more than once; the helper fails closed and refuses to edit"
+              : "input.lua was edited outside; the runtime value applies until the next reload or toggle"
+          }
+          MouseArea { id: dwtCaptionMouse; anchors.fill: parent; hoverEnabled: true }
         }
 
         PanelSeparator { width: parent.width }
@@ -225,6 +315,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             checked: root.tapToClick
             busy: applyProc.running
+            interactive: root.stateLoaded && !root.helperMissing
             onToggled: root.setTap(!root.tapToClick)
 
             PanelToolTip {
@@ -234,40 +325,65 @@ Panel {
           }
         }
 
-        PanelSeparator { width: parent.width }
-
-        // Timeout slider.
-        Item {
+        // Divergence / problem caption for the tap row.
+        Text {
           width: parent.width
-          height: timeoutHeader.implicitHeight
-
-          Text {
-            id: timeoutHeader
-            anchors.left: parent.left
-            text: "TIMEOUT AFTER KEYPRESS"
-            color: Color.popups.text
-            opacity: 0.7
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Text {
-            anchors.right: parent.right
-            text: timeoutSlider.liveValue.toFixed(1) + " s"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-          }
+          visible: root.tapState === "pending" || root.tapState === "ambiguous"
+          text: root.tapState === "ambiguous"
+            ? "CLAVE DUPLICADA EN input.lua — CORRIGE A MANO"
+            : "EN ARCHIVO: " + (root.tapFile === true ? "ON" : "OFF") + " · PENDIENTE DE RELOAD"
+          color: root.tapState === "ambiguous" ? Color.urgent : Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
-        PanelSlider {
-          id: timeoutSlider
+        PanelSeparator { width: parent.width }
+
+        // Loading state: shown until the first get --json succeeds.
+        Text {
           width: parent.width
-          bar: root.bar
-          minimum: 0.5
-          maximum: 3.0
-          step: 0.1
-          value: root.timeoutSeconds
-          onReleased: function(v) { root.applyTimeout(v) }
+          visible: !root.stateLoaded && root.errorText === "" && !root.helperMissing
+          text: "LEYENDO ESTADO…"
+          color: Color.popups.text
+          opacity: 0.5
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        // Setup note (amber): doctor found something incomplete (e.g. quirk
+        // missing). Informational; the switches still work.
+        Text {
+          width: parent.width
+          visible: root.setupIncomplete
+          text: "QUIRK DE TECLADO INTERNO NO DETECTADO; DWT PUEDE NO ACTUAR — VER README"
+          color: Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        // Non-blocking note from the helper (amber): `warning:` lines that
+        // came with exit 0 (e.g. new config errors outside input.lua).
+        Text {
+          width: parent.width
+          visible: root.noteText !== ""
+          text: root.noteText
+          color: Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        // Error row (red): helper stderr on a failed toggle or refresh.
+        Text {
+          width: parent.width
+          visible: root.errorText !== ""
+          text: "Error: " + root.errorText
+          color: Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
       }
     }

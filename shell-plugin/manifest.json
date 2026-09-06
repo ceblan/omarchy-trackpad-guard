@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ceblan.trackpad-guard",
   "name": "Trackpad Guard",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "ceblan",
   "license": "MIT",
-  "description": "Bar icon and control panel for omarchy-trackpad-guard: daemon toggle, tap-to-click and typing-idle timeout.",
+  "description": "Bar icon and control panel for native Hyprland/libinput palm rejection: disable-while-typing and tap-to-click toggles.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Trackpad Guard",
-    "description": "Disable the touchpad while typing; control the guard daemon, tap-to-click and idle timeout.",
+    "description": "Native disable-while-typing (DWT) and tap-to-click switches for the internal touchpad.",
     "category": "Input",
     "allowMultiple": false,
     "defaultSection": "right"
